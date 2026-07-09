@@ -87,5 +87,7 @@ building a decision tree:
 - pros: the tree is easy to build, easy to interpret
 - cons: sensitive to slight changes in data, doesn't guarantee the optimal tree
 
-random forest
+random forest: bootstrap sampling (draw out several repeatable samples from the dataset) + feature sampling (choose several features from all of them, ensuring the diversity of different decision trees)
+- form different decision trees
+- vote the prediction result by majority
 
