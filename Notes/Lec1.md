@@ -41,7 +41,7 @@ classfication evaluation: false positive rate, false negative rate
 - confusion matrix
 - metrics: precision (positive prediction accuracy), recall (positive recognition rate), F1 score (harmonic mean of precision and recall), accuracy
 - single measurement may lead to useless classifier
-- multipule categories: **one-vs-rest**, with micro/macro averaging
+- multipule categories: **one-vs-rest**, with micro averaging (averaging each unit and then calculate F1) / macro averaging (calculate F1 for each case and then averaging)
 
 linear model: $\hat{y}=f(w)$, every independent input **engaged linearly** in the production of $w$ ($w$ can be expressed in a matrix/vector form)
 - however, $f$ doesn't need to be a linear function
