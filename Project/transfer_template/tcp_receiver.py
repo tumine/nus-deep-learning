@@ -2,7 +2,7 @@ from socket import *
 import json
 import struct
 
-SERVER_HOST = '172.20.10.7'
+SERVER_HOST = '0.0.0.0'
 SERVER_PORT = 2105
 BUFFER_SIZE = 65536  # 64KB buffer for file transfer
 OUTPUT_DIR = './received'  # 接收文件的保存目录
