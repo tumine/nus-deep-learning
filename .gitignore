@@ -1,0 +1,86 @@
+# --- Python ---
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# C extensions
+*.so
+
+# Distribution / packaging
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+share/python-wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+MANIFEST
+
+# Virtual environments
+.venv/
+venv/
+env/
+ENV/
+env.bak/
+venv.bak/
+
+# Type checkers / linters
+.mypy_cache/
+.dmypy.json
+dmypy.json
+.pyre/
+.pytype/
+.ruff_cache/
+.pytest_cache/
+.tox/
+.coverage
+.coverage.*
+htmlcov/
+.cache/
+
+# Jupyter
+.ipynb_checkpoints
+
+# --- IDE ---
+.idea/
+.vscode/
+
+# --- Deep Learning artifacts ---
+# Model checkpoints & weights
+*.pt
+*.pth
+*.ckpt
+*.h5
+*.onnx
+*.safetensors
+checkpoints/
+weights/
+models/
+
+# Experiment tracking & logs
+wandb/
+runs/
+tb_logs/
+logs/
+*.log
+
+# Environment variables
+.env
+
+# --- Project-specific cache ---
+.merkle-snapshot.json
+
+# --- OS ---
+.DS_Store
+Thumbs.db
