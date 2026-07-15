@@ -443,7 +443,10 @@ def build_model(
 
     # ---- 替换分类头 ----
     # 为细粒度分类设计多层分类头：更强的非线性 + Dropout 防过拟合
+    # 注意：ConvNeXt 的 classifier 内部包含 Flatten，替换后需补上；
+    #       对 ResNet/EfficientNet（已在 forward 中 flatten），Flatten 是无操作的。
     new_head = nn.Sequential(
+        nn.Flatten(1),
         nn.Linear(classifier_in, 1024),
         nn.BatchNorm1d(1024),
         nn.ReLU(inplace=True),
