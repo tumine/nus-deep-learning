@@ -178,14 +178,18 @@ def detect_gpu() -> dict:
 # 数据集与数据增强
 # ============================================================
 
-CAT_BREEDS = ["ragdoll", "singapura", "persian", "sphynx", "pallas"]
+# 类别列表 — 注意：ImageFolder 按目录名字母排序，最终顺序由 class_info 决定
+# 实际顺序（字母序）: other(如果有), pallas, persian, ragdoll, singapura, sphynx
+# 如需引入"非猫"类别，创建 other/ 目录并放入随机非猫图片即可自动识别
+CAT_BREEDS_SORTED = ["pallas", "persian", "ragdoll", "singapura", "sphynx"]
 
 BREED_CN = {
+    "pallas": "兔狲",
+    "persian": "波斯猫",
     "ragdoll": "布偶猫",
     "singapura": "新加坡猫",
-    "persian": "波斯猫",
     "sphynx": "斯芬克斯猫",
-    "pallas": "兔狲",
+    "other": "非猫/其他",
 }
 
 
@@ -253,14 +257,23 @@ def prepare_datasets(
     total_size = len(full_dataset)
 
     logger.info("\n数据集目录结构:")
-    for breed in CAT_BREEDS:
+    # 列出所有子目录（包括可能存在的 other/）
+    all_dirs = list(CAT_BREEDS_SORTED)
+    other_dir = data_path / "other"
+    if other_dir.exists() and other_dir.is_dir():
+        if "other" not in all_dirs:
+            all_dirs.append("other")
+    for breed in all_dirs:
         breed_dir = data_path / breed
         if breed_dir.exists():
             count = len(list(breed_dir.glob("*.[jJ][pP][gG]")))
             count += len(list(breed_dir.glob("*.[pP][nN][gG]")))
-            logger.info(f"  {breed}/ ({BREED_CN.get(breed, breed)}): {count} 张")
+            cn_name = BREED_CN.get(breed, breed)
+            extra = " 🚫 非猫拒识类" if breed == "other" else ""
+            logger.info(f"  {breed}/ ({cn_name}): {count} 张{extra}")
         else:
-            logger.warning(f"  ⚠️ {breed}/ 目录不存在！")
+            if breed != "other":
+                logger.warning(f"  ⚠️ {breed}/ 目录不存在！")
 
     generator = torch.Generator().manual_seed(seed)
     test_dataset = None

@@ -184,17 +184,27 @@ class TcpBreedServer:
         port: int = 9000,
         host: str = "0.0.0.0",
         max_clients: int = 10,
+        confidence_threshold: float = 0.50,
     ):
         self.host = host
         self.port = port
         self.max_clients = max_clients
         self.backend = backend
+        self.confidence_threshold = confidence_threshold
 
         # 加载分类器（使用缓存的单例）
         logger.info(f"加载模型: {model_path} [backend={backend}]")
-        self.classifier = get_classifier(model_path, backend=backend)
+        # 注意: get_classifier 使用缓存，如果已加载则不会更新 threshold
+        # 如需更改 threshold，直接使用 CatBreedClassifier 构造
+        from deploy.inference import CatBreedClassifier
+        self.classifier = CatBreedClassifier(
+            model_path=model_path,
+            backend=backend,
+            confidence_threshold=confidence_threshold,
+        )
         self.classifier.load_model()
-        logger.info(f"模型加载完成 (device={self.classifier.device})")
+        logger.info(f"模型加载完成 (device={self.classifier.device}, "
+                     f"拒识: {'✅ 支持' if self.classifier.has_other_class else '⚠️ 仅阈值兜底'})")
 
         # 运行状态
         self._running = False
@@ -234,11 +244,13 @@ class TcpBreedServer:
         logger.info("=" * 60)
         logger.info(f"🐱 猫品种分类 TCP 推理服务")
         logger.info("=" * 60)
-        logger.info(f"  地址:     tcp://{self.host}:{self.port}")
-        logger.info(f"  模型后端: {self.backend}")
-        logger.info(f"  计算设备: {self.classifier.device}")
-        logger.info(f"  最大连接: {self.max_clients}")
-        logger.info(f"  协议:     长度前缀 + JPEG 图像 → JSON 结果")
+        logger.info(f"  地址:       tcp://{self.host}:{self.port}")
+        logger.info(f"  模型后端:   {self.backend}")
+        logger.info(f"  计算设备:   {self.classifier.device}")
+        logger.info(f"  最大连接:   {self.max_clients}")
+        logger.info(f"  置信度阈值: {self.confidence_threshold:.2f}")
+        logger.info(f"  拒识能力:   {'✅ other类 + 阈值' if self.classifier.has_other_class else '⚠️  仅阈值兜底'}")
+        logger.info(f"  协议:       长度前缀 + JPEG 图像 → JSON 结果")
         logger.info("=" * 60)
         logger.info("等待客户端连接... (Ctrl+C 停止)")
 
@@ -339,6 +351,7 @@ class TcpBreedServer:
                     f"[推理] {client_label} → "
                     f"{result.class_name_cn} ({result.confidence*100:.1f}%) "
                     f"延迟={latency:.1f}ms"
+                    + (" 🚫 非猫图片" if result.is_not_cat else "")
                 )
 
         except ConnectionError as e:
@@ -422,9 +435,17 @@ class TcpBreedServer:
 # 便捷函数：起一个推理服务
 # ============================================================
 
-def serve(host: str = "0.0.0.0", port: int = 9000, model_path: str = "best_model.pth") -> None:
+def serve(
+    host: str = "0.0.0.0",
+    port: int = 9000,
+    model_path: str = "best_model.pth",
+    confidence_threshold: float = 0.50,
+) -> None:
     """一键启动 TCP 推理服务（供外部脚本调用）。"""
-    server = TcpBreedServer(model_path=model_path, port=port, host=host)
+    server = TcpBreedServer(
+        model_path=model_path, port=port, host=host,
+        confidence_threshold=confidence_threshold,
+    )
     server.start()
 
 
@@ -455,6 +476,8 @@ def main() -> None:
     parser.add_argument("--host", type=str, default="0.0.0.0", help="监听地址")
     parser.add_argument("--port", type=int, default=9000, help="监听端口")
     parser.add_argument("--max-clients", type=int, default=10, help="最大并发连接数")
+    parser.add_argument("--confidence-threshold", type=float, default=0.50,
+                        help="置信度阈值（0-1），低于此值判定为非猫（默认 0.50）")
     args = parser.parse_args()
 
     server = TcpBreedServer(
@@ -463,6 +486,7 @@ def main() -> None:
         host=args.host,
         port=args.port,
         max_clients=args.max_clients,
+        confidence_threshold=args.confidence_threshold,
     )
     server.start()
 
