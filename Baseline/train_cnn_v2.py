@@ -42,6 +42,8 @@ import torch.optim as optim
 from torch.cuda.amp import GradScaler, autocast
 from torch.utils.data import DataLoader
 from torch.utils.tensorboard import SummaryWriter
+from contextlib import nullcontext
+
 from torchvision import datasets, transforms
 from torchvision.transforms import functional as TF
 
@@ -135,6 +137,7 @@ def detect_gpu() -> dict:
         "name": "CPU",
         "vram_gb": 0,
         "use_amp": False,
+        "use_bf16": False,  # Ada Lovelace+ 启用 bfloat16（无需 GradScaler）
         "cuda_available": False,
     }
 
@@ -155,11 +158,19 @@ def detect_gpu() -> dict:
     gpu_info["device"] = torch.device("cuda:0")
     gpu_info["use_amp"] = True
 
-    # cuDNN 自动调优
+    # === GPU 训练加速配置 ===
+    # 1. cuDNN 自动调优：首次迭代选择最优卷积算法
     torch.backends.cudnn.benchmark = True
-    # Ada Lovelace (RTX 4070) 额外优化
+    # 2. 启用 TF32（RTX 30/40 系列在 Ampere/Ada 架构有硬件加速）
+    torch.backends.cuda.matmul.allow_tf32 = True
+    torch.backends.cudnn.allow_tf32 = True
+    # 3. 大显存 GPU 启用更高 matmul 精度
     if gpu_info["vram_gb"] >= 10:
         torch.set_float32_matmul_precision("high")
+    # 4. 检测 Ada Lovelace（RTX 40 系列）— 启用 bfloat16
+    #    bfloat16 与 fp16 速度相当但动态范围更广，无需 GradScaler
+    if "RTX 40" in device_name or "RTX 50" in device_name or "Ada" in device_name:
+        gpu_info["use_bf16"] = True
 
     logger.info("=" * 60)
     logger.info("GPU 检测报告")
@@ -169,6 +180,8 @@ def detect_gpu() -> dict:
     logger.info(f"  CUDA 版本:    {torch.version.cuda}")
     logger.info(f"  PyTorch 版本: {torch.__version__}")
     logger.info(f"  混合精度训练: {'✅ 启用' if gpu_info['use_amp'] else '❌ 不支持'}")
+    logger.info(f"  BFloat16:     {'✅ 启用（Ada+）' if gpu_info['use_bf16'] else '❌'}")
+    logger.info(f"  TF32:         ✅ 启用")
     logger.info("=" * 60)
 
     return gpu_info
@@ -561,6 +574,8 @@ def train_one_epoch(
     max_grad_norm: float = 1.0,
     use_mixup: bool = True,
     mixup_alpha: float = 0.8,
+    use_channels_last: bool = False,
+    use_bf16: bool = False,
 ) -> Tuple[float, float]:
     """训练一个 epoch。"""
     model.train()
@@ -569,8 +584,20 @@ def train_one_epoch(
     total = 0
     start_time = time.time()
 
+    # AMP 上下文：fp16 (scaler) / bf16 / 不用 amp
+    if scaler is not None:
+        amp_ctx = autocast()  # 默认 fp16
+    elif use_bf16:
+        amp_ctx = torch.amp.autocast(device_type="cuda", dtype=torch.bfloat16)
+    else:
+        amp_ctx = nullcontext()
+
     for batch_idx, (images, labels) in enumerate(dataloader):
-        images = images.to(device, non_blocking=True)
+        # 输入与模型保持一致的内存格式（channels_last → NHWC 零拷贝开销）
+        if use_channels_last:
+            images = images.to(device, non_blocking=True, memory_format=torch.channels_last)
+        else:
+            images = images.to(device, non_blocking=True)
         labels = labels.to(device, non_blocking=True)
 
         # MixUp / CutMix
@@ -593,24 +620,22 @@ def train_one_epoch(
 
         optimizer.zero_grad(set_to_none=True)
 
+        with amp_ctx:
+            outputs = model(images)
+            if mixed:
+                loss = mixup_loss(criterion, outputs, labels_a, labels_b, lam)
+            else:
+                loss = criterion(outputs, labels)
+
         if scaler is not None:
-            with autocast():
-                outputs = model(images)
-                if mixed:
-                    loss = mixup_loss(criterion, outputs, labels_a, labels_b, lam)
-                else:
-                    loss = criterion(outputs, labels)
+            # fp16 需要 GradScaler 处理 inf/nan
             scaler.scale(loss).backward()
             scaler.unscale_(optimizer)
             torch.nn.utils.clip_grad_norm_(model.parameters(), max_grad_norm)
             scaler.step(optimizer)
             scaler.update()
         else:
-            outputs = model(images)
-            if mixed:
-                loss = mixup_loss(criterion, outputs, labels_a, labels_b, lam)
-            else:
-                loss = criterion(outputs, labels)
+            # bf16 / fp32 直接反传
             loss.backward()
             torch.nn.utils.clip_grad_norm_(model.parameters(), max_grad_norm)
             optimizer.step()
@@ -643,6 +668,7 @@ def validate(
     dataloader: DataLoader,
     criterion: nn.Module,
     device: torch.device,
+    use_channels_last: bool = False,
 ) -> Tuple[float, float]:
     """在验证集上评估模型。"""
     model.eval()
@@ -651,7 +677,10 @@ def validate(
     total = 0
 
     for images, labels in dataloader:
-        images = images.to(device, non_blocking=True)
+        if use_channels_last:
+            images = images.to(device, non_blocking=True, memory_format=torch.channels_last)
+        else:
+            images = images.to(device, non_blocking=True)
         labels = labels.to(device, non_blocking=True)
 
         outputs = model(images)
@@ -771,6 +800,8 @@ def main():
                         help="禁用混合精度训练")
     parser.add_argument("--no-mixup", action="store_true",
                         help="禁用 MixUp/CutMix 数据增强")
+    parser.add_argument("--no-compile", action="store_true",
+                        help="禁用 torch.compile（默认启用以加速训练）")
 
     args = parser.parse_args()
 
@@ -871,7 +902,12 @@ def main():
                 f.write(f"{img_path}\t{label}\t{full_dataset.classes[label]}\n")
         logger.info(f"测试集路径清单已保存: {test_paths_file}")
 
-    # 数据加载器
+    # 数据加载器（GPU 利用率优化的关键）
+    # persistent_workers=True 避免每个 epoch 重新 spawn worker
+    #   ⭐ 这是消除 GPU 监视图上"谷底"（epoch 间 30-40s 空闲）的核心改动
+    # prefetch_factor=4 提高预取批次数量，掩盖 CPU 端数据加载延迟
+    # pin_memory_device="cuda" 让 pinned memory 直接在 GPU 端可访问，减少一次拷贝
+    use_persistent = args.workers > 0
     train_loader = DataLoader(
         train_dataset,
         batch_size=args.batch,
@@ -879,6 +915,9 @@ def main():
         num_workers=args.workers,
         pin_memory=True if gpu_info["cuda_available"] else False,
         drop_last=True,
+        persistent_workers=use_persistent,
+        prefetch_factor=4 if use_persistent else None,
+        pin_memory_device="cuda" if gpu_info["cuda_available"] else "",
     )
 
     val_loader = DataLoader(
@@ -887,6 +926,9 @@ def main():
         shuffle=False,
         num_workers=args.workers,
         pin_memory=True if gpu_info["cuda_available"] else False,
+        persistent_workers=use_persistent,
+        prefetch_factor=4 if use_persistent else None,
+        pin_memory_device="cuda" if gpu_info["cuda_available"] else "",
     )
 
     num_classes = class_info["num_classes"]
@@ -907,11 +949,37 @@ def main():
     )
     model = model.to(device)
 
+    # === GPU 训练加速配置 ===
+    use_channels_last = (
+        args.backbone.startswith(("convnext", "efficientnet"))
+        and gpu_info["cuda_available"]
+    )
+    if use_channels_last:
+        # channels_last (NHWC) 内存格式对 ConvNeXt/EfficientNet 在 CUDA 上的
+        # Tensor Core 计算更友好，可获得 10-30% 加速
+        model = model.to(memory_format=torch.channels_last)
+        logger.info("✅ 模型已转换为 channels_last (NHWC) 内存格式")
+
+    # torch.compile：算子融合 + 减少 kernel launch overhead
+    if (
+        not args.no_compile
+        and gpu_info["cuda_available"]
+        and hasattr(torch, "compile")
+    ):
+        try:
+            model = torch.compile(model, mode="reduce-overhead")
+            logger.info("✅ torch.compile 已启用（mode=reduce-overhead）"
+                        " — 首次迭代会较慢（编译），后续 epoch 显著加速")
+        except Exception as e:
+            logger.warning(f"⚠️  torch.compile 启用失败，回退到 eager 模式: {e}")
+
     # ============================================================
     # 4. 训练
     # ============================================================
     criterion = nn.CrossEntropyLoss(label_smoothing=args.label_smoothing)
-    scaler = GradScaler() if use_amp else None
+    # bfloat16 不需要 GradScaler（动态范围与 fp32 相同）；fp16 需要
+    use_bf16 = gpu_info.get("use_bf16", False) and use_amp
+    scaler = GradScaler() if (use_amp and not use_bf16) else None
 
     logger.info(f"\n正则化配置:")
     logger.info(f"  Label Smoothing:     {args.label_smoothing}")
@@ -956,9 +1024,14 @@ def main():
             max_grad_norm=args.grad_clip,
             use_mixup=use_mixup,
             mixup_alpha=args.mixup_alpha,
+            use_channels_last=use_channels_last,
+            use_bf16=use_bf16,
         )
 
-        val_loss, val_acc = validate(model, val_loader, criterion, device)
+        val_loss, val_acc = validate(
+            model, val_loader, criterion, device,
+            use_channels_last=use_channels_last,
+        )
 
         current_lr = optimizer.param_groups[0]["lr"]
         scheduler.step()
@@ -1084,12 +1157,17 @@ def main():
             max_grad_norm=args.grad_clip,
             use_mixup=use_mixup,
             mixup_alpha=args.mixup_alpha,
+            use_channels_last=use_channels_last,
+            use_bf16=use_bf16,
         )
 
         ema.update(model)
 
         ema.apply_shadow(model)
-        val_loss, val_acc = validate(model, val_loader, criterion, device)
+        val_loss, val_acc = validate(
+            model, val_loader, criterion, device,
+            use_channels_last=use_channels_last,
+        )
         ema.restore(model)
 
         current_lrs = [g["lr"] for g in optimizer.param_groups]
