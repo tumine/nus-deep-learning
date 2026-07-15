@@ -204,7 +204,7 @@ class TcpBreedServer:
         )
         self.classifier.load_model()
         logger.info(f"模型加载完成 (device={self.classifier.device}, "
-                     f"拒识: {'✅ 支持' if self.classifier.has_other_class else '⚠️ 仅阈值兜底'})")
+                     f"拒识: 阈值兜底 (threshold={self.confidence_threshold:.2f}))")
 
         # 运行状态
         self._running = False
@@ -249,7 +249,7 @@ class TcpBreedServer:
         logger.info(f"  计算设备:   {self.classifier.device}")
         logger.info(f"  最大连接:   {self.max_clients}")
         logger.info(f"  置信度阈值: {self.confidence_threshold:.2f}")
-        logger.info(f"  拒识能力:   {'✅ other类 + 阈值' if self.classifier.has_other_class else '⚠️  仅阈值兜底'}")
+        logger.info(f"  拒识能力:   阈值兜底 (threshold={self.confidence_threshold:.2f})")
         logger.info(f"  协议:       长度前缀 + JPEG 图像 → JSON 结果")
         logger.info("=" * 60)
         logger.info("等待客户端连接... (Ctrl+C 停止)")

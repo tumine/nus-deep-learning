@@ -43,7 +43,6 @@ BREED_CN = {
     "ragdoll": "布偶猫",
     "singapura": "新加坡猫",
     "sphynx": "斯芬克斯猫",
-    "other": "非猫/其他",
 }
 
 
@@ -165,7 +164,6 @@ class CatBreedClassifier:
                 logger.info(
                     f"Checkpoint 信息: backbone={self._backbone}, "
                     f"input_size={self.input_size}, classes={self.class_names}"
-                    + (" (含拒识类)" if self._has_other_class else "")
                 )
             except Exception:
                 logger.warning("无法读取 checkpoint 元数据，使用默认配置")
@@ -257,8 +255,7 @@ class CatBreedClassifier:
             self._cat_indices = [
                 i for i, name in enumerate(self.class_names) if name != "other"
             ]
-            logger.info(f"从 checkpoint 加载类别: {self.class_names}"
-                        + (" (含拒识类)" if self._has_other_class else ""))
+            logger.info(f"从 checkpoint 加载类别: {self.class_names}")
         num_classes = len(self.class_names)
         dropout_p = 0.5  # 默认值
 
@@ -530,9 +527,8 @@ class CatBreedClassifier:
     def _build_result(self, probs: np.ndarray, latency_ms: float) -> InferenceResult:
         """构建推理结果，包含非猫拒识逻辑。
 
-        两层防御策略：
-        1. 如果模型有 "other" 类别且得分最高 → 直接判定为非猫
-        2. 如果模型无 "other" 类别，但最高置信度低于阈值 → 判定为非猫（兜底）
+        由于训练集已移除 "other" 类别，仅使用置信度阈值兜底：
+        - 若最高置信度低于阈值 → 判定为非猫图片
         """
         class_names = self.class_names
         top5_idx = np.argsort(probs)[::-1][:5]
@@ -551,13 +547,13 @@ class CatBreedClassifier:
         confidence = float(probs[pred_idx])
         pred_name = class_names[pred_idx]
 
-        # ---- 非猫拒识判断 ----
+        # ---- 非猫拒识判断（仅阈值兜底）----
         is_not_cat = False
 
         if self._has_other_class and pred_name == "other":
             # 情形1: 模型有 other 类别且预测为 other → 明确拒识
             is_not_cat = True
-            confidence = float(probs[pred_idx])  # other 类的置信度
+            confidence = float(probs[pred_idx])
         elif confidence < self.confidence_threshold:
             # 情形2: 最高置信度不足阈值 → 兜底拒识
             is_not_cat = True
@@ -570,7 +566,7 @@ class CatBreedClassifier:
         return InferenceResult(
             class_id=pred_idx,
             class_name=pred_name,
-            class_name_cn=BREED_CN.get(pred_name, pred_name),
+            class_name_cn=BREED_CN.get(pred_name, "非猫/其他"),
             confidence=confidence,
             top5_probs=top5,
             latency_ms=latency_ms,
