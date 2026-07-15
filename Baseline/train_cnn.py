@@ -175,19 +175,27 @@ def get_transforms() -> Tuple[transforms.Compose, transforms.Compose]:
     imagenet_std = [0.229, 0.224, 0.225]
     
     # 训练集数据增强
-    # 模拟小车在实际环境中可能遇到的光照、角度变化
+    # 丰富增强策略，抑制 Phase 2 微调时的过拟合：
+    #   - RandAugment：自动搜索的最优增强组合（TorchVision 内置）
+    #   - RandomErasing：随机遮挡矩形区域，迫使模型关注整体特征而非局部细节
+    #   - 颜色抖动参数适度调大，模拟小车在不同光照下的真实场景
     train_transforms = transforms.Compose([
-        transforms.RandomResizedCrop(224, scale=(0.7, 1.0)),
+        transforms.RandomResizedCrop(224, scale=(0.6, 1.0)),
         transforms.RandomHorizontalFlip(p=0.5),
-        transforms.RandomRotation(degrees=15),
+        transforms.RandomRotation(degrees=20),
         transforms.ColorJitter(
-            brightness=0.2,   # 模拟不同光照条件
-            contrast=0.2,
-            saturation=0.2,
-            hue=0.1,
+            brightness=0.3,   # 扩大光照变化范围
+            contrast=0.3,
+            saturation=0.3,
+            hue=0.15,
         ),
-        transforms.RandomAffine(degrees=0, translate=(0.1, 0.1)),
+        transforms.RandomAffine(degrees=0, translate=(0.15, 0.15)),
+        transforms.RandomGrayscale(p=0.05),       # 5% 概率灰度化（鲁棒性）
+        transforms.RandomPerspective(p=0.3),       # 30% 概率透视变换
         transforms.ToTensor(),
+        transforms.RandomErasing(                  # 随机遮挡（正则化利器）
+            p=0.3, scale=(0.02, 0.10), ratio=(0.3, 3.3)
+        ),
         transforms.Normalize(mean=imagenet_mean, std=imagenet_std),
     ])
     
@@ -355,12 +363,17 @@ def build_model(num_classes: int = 5, freeze_backbone: bool = True) -> nn.Module
     # 权重文件缓存路径: ~/.cache/torch/hub/checkpoints/
     model = models.resnet50(weights=ResNet50_Weights.IMAGENET1K_V2)
     
-    # 替换分类头
-    # 原 fc 层: Linear(2048, 1000) → 新分类头: 2048 → 512 → 5
+    # 替换分类头 — 加入 BatchNorm 和更强的 Dropout 以抑制过拟合
+    # 原 fc 层: Linear(2048, 1000) → 新分类头: 2048 → 1024 → BatchNorm → 512 → 5
     num_features = model.fc.in_features  # 2048
     
     model.fc = nn.Sequential(
-        nn.Linear(num_features, 512),
+        nn.Linear(num_features, 1024),
+        nn.BatchNorm1d(1024),
+        nn.ReLU(inplace=True),
+        nn.Dropout(p=0.6),               # 提高 dropout 比例（原 0.5 → 0.6）
+        nn.Linear(1024, 512),
+        nn.BatchNorm1d(512),
         nn.ReLU(inplace=True),
         nn.Dropout(p=0.5),
         nn.Linear(512, num_classes),
@@ -402,6 +415,7 @@ def train_one_epoch(
     scaler: Optional[GradScaler],
     epoch: int,
     total_epochs: int,
+    max_grad_norm: float = 1.0,
 ) -> Tuple[float, float]:
     """
     训练一个 epoch。
@@ -409,12 +423,13 @@ def train_one_epoch(
     Args:
         model: 模型
         dataloader: 训练数据加载器
-        criterion: 损失函数
+        criterion: 损失函数（支持 label smoothing）
         optimizer: 优化器
         device: 计算设备
         scaler: 混合精度 GradScaler（None 表示不使用 AMP）
         epoch: 当前 epoch 编号
         total_epochs: 总 epoch 数
+        max_grad_norm: 梯度裁剪阈值（默认 1.0，防止梯度爆炸导致过拟合）
     
     Returns:
         (平均损失, 准确率)
@@ -438,12 +453,16 @@ def train_one_epoch(
                 outputs = model(images)
                 loss = criterion(outputs, labels)
             scaler.scale(loss).backward()
+            # 梯度裁剪（混合精度下先 unscale 再 clip）
+            scaler.unscale_(optimizer)
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_grad_norm)
             scaler.step(optimizer)
             scaler.update()
         else:
             outputs = model(images)
             loss = criterion(outputs, labels)
             loss.backward()
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_grad_norm)
             optimizer.step()
         
         # 统计
@@ -505,6 +524,66 @@ def validate(
     accuracy = correct / total
     
     return avg_loss, accuracy
+
+
+# ============================================================
+# EMA (Exponential Moving Average) — 模型参数平滑
+# ============================================================
+
+class EMAModel:
+    """
+    指数移动平均模型参数平滑器。
+
+    训练时维护一份 shadow copy，每个 step 按衰减率更新:
+        shadow = decay * shadow + (1 - decay) * model
+
+    评估/保存时切换到 EMA 参数——EMA 模型通常比原始模型具有更好的
+    泛化性能，是缓解 Phase 2 过拟合的实用技巧。
+
+    用法:
+        ema = EMAModel(model, decay=0.999)
+        for batch in dataloader:
+            train_step(model, ...)
+            ema.update(model)         # 每步更新 shadow
+
+        ema.apply_shadow(model)       # 验证/保存前切换到 EMA 参数
+        val_acc = validate(model, ...)
+        ema.restore(model)            # 恢复继续训练
+    """
+
+    def __init__(self, model: nn.Module, decay: float = 0.999):
+        self.decay = decay
+        self.shadow: dict[str, torch.Tensor] = {}
+        self.backup: dict[str, torch.Tensor] = {}
+        # 初始化 shadow 为原始参数副本
+        for name, param in model.named_parameters():
+            if param.requires_grad:
+                self.shadow[name] = param.data.clone().detach()
+
+    @torch.no_grad()
+    def update(self, model: nn.Module):
+        """使用当前模型参数更新 shadow。"""
+        for name, param in model.named_parameters():
+            if param.requires_grad:
+                self.shadow[name].mul_(self.decay).add_(
+                    param.data, alpha=1.0 - self.decay
+                )
+
+    @torch.no_grad()
+    def apply_shadow(self, model: nn.Module):
+        """将 EMA shadow 参数应用到模型（验证/保存前调用）。"""
+        for name, param in model.named_parameters():
+            if param.requires_grad:
+                self.backup[name] = param.data.clone()
+                param.data.copy_(self.shadow[name])
+
+    @torch.no_grad()
+    def restore(self, model: nn.Module):
+        """恢复原始参数（继续训练前调用）。"""
+        for name, param in model.named_parameters():
+            if param.requires_grad:
+                param.data.copy_(self.backup[name])
+        self.backup.clear()
 
 
 # ============================================================
@@ -577,6 +656,28 @@ def main():
         type=float,
         default=0.0001,
         help="阶段二微调学习率（默认 0.0001）",
+    )
+    parser.add_argument(
+        "--label-smoothing",
+        type=float,
+        default=0.1,
+        help="Label Smoothing 系数（默认 0.1）。"
+             "将硬标签 [0,1,0,0,0] 平滑为 [0.02,0.92,0.02,0.02,0.02]，"
+             "阻止模型对训练样本过于自信，是抑制过拟合的有效手段。",
+    )
+    parser.add_argument(
+        "--weight-decay",
+        type=float,
+        default=5e-4,
+        help="权重衰减系数 L2 正则化（默认 5e-4）。"
+             "Phase 2 的解冻层参数多、数据少，需要比 Phase 1 更强的 weight decay。",
+    )
+    parser.add_argument(
+        "--grad-clip",
+        type=float,
+        default=1.0,
+        help="梯度裁剪阈值（默认 1.0）。"
+             "限制梯度范数，防止微调时梯度爆炸引起过拟合。",
     )
     
     # 其他
@@ -752,11 +853,21 @@ def main():
     # 4. 训练
     # ============================================================
     
-    criterion = nn.CrossEntropyLoss()
+    # Label Smoothing 损失函数：将硬标签 [0,1,0,0,0] 平滑为 [ε/4, 1-ε, ε/4, ε/4, ε/4]
+    # 阻止模型对训练样本过度自信（output prob → 1.0），显著抑制过拟合
+    criterion = nn.CrossEntropyLoss(label_smoothing=args.label_smoothing)
     scaler = GradScaler() if use_amp else None
+    
+    logger.info(f"\n正则化配置:")
+    logger.info(f"  Label Smoothing:     {args.label_smoothing}")
+    logger.info(f"  Weight Decay:        {args.weight_decay}")
+    logger.info(f"  Gradient Clipping:   {args.grad_clip}")
     
     best_val_acc = 0.0
     total_epoch = 0
+    
+    # EMA（仅 Phase 2 启用，Phase 1 只训练分类头不需要）
+    ema: Optional[EMAModel] = None
     
     # ----------------------------------------------------------
     # 阶段一：特征提取（冻结骨干，仅训练分类头）
@@ -770,8 +881,11 @@ def main():
     logger.info(f"  - Epochs:   1-{args.phase1_epochs}")
     logger.info("=" * 60)
     
-    # 优化器（只优化分类头参数）
-    optimizer = optim.AdamW(model.fc.parameters(), lr=args.lr, weight_decay=1e-4)
+    # 优化器 — 阶段一 weight_decay 用默认值的 1/5（分类头新参数，不需要强正则）
+    optimizer = optim.AdamW(
+        model.fc.parameters(), lr=args.lr,
+        weight_decay=args.weight_decay * 0.2
+    )
     scheduler = optim.lr_scheduler.CosineAnnealingLR(
         optimizer, T_max=args.phase1_epochs
     )
@@ -784,6 +898,7 @@ def main():
         train_loss, train_acc = train_one_epoch(
             model, train_loader, criterion, optimizer,
             device, scaler, epoch, args.phase1_epochs,
+            max_grad_norm=args.grad_clip,
         )
         
         # 验证
@@ -826,14 +941,28 @@ def main():
     # ----------------------------------------------------------
     # 阶段二：微调（解冻 layer3-4，全局微调）
     # ----------------------------------------------------------
+    #
+    # 阶段二过拟合风险最高，引入以下多层正则化策略:
+    #   1. Label Smoothing (ε=0.1): 阻止模型对训练样本过度自信
+    #   2. 差异化 Weight Decay: 解冻层参数多 → 更高 L2 惩罚
+    #   3. 梯度裁剪 (max_norm=1.0): 防止梯度爆炸
+    #   4. EMA (decay=0.999): 参数平滑，提升泛化能力
+    #   5. 降低解冻层学习率: 防止破坏预训练特征
+    #   6. 缩短早停耐心: 更快停止过拟合
+    # ----------------------------------------------------------
     
     logger.info("\n" + "=" * 60)
-    logger.info("阶段二：微调（Fine-tuning）")
-    logger.info("  - Layer1-2: 冻结 ❄️（通用特征）")
-    logger.info("  - Layer3-4: 解冻 🔥（品种特定特征）")
-    logger.info("  - 分类头:   训练 🔥")
-    logger.info(f"  - 学习率:   差异化 LR")
-    logger.info(f"  - Epochs:   {args.phase1_epochs+1}-{args.epochs}")
+    logger.info("阶段二：微调（Fine-tuning）— 强化正则化")
+    logger.info("  - Layer1-2:       冻结 ❄️（通用特征）")
+    logger.info("  - Layer3-4:       解冻 🔥（品种特定特征）")
+    logger.info("  - 分类头:         训练 🔥")
+    logger.info(f"  - Label Smoothing: {args.label_smoothing}")
+    logger.info(f"  - Weight Decay:    {args.weight_decay}（强化）")
+    logger.info(f"  - Gradient Clip:   {args.grad_clip}")
+    logger.info(f"  - EMA:             decay=0.999 ✅")
+    logger.info(f"  - 学习率:         差异化 LR（降低避免破坏预训练特征）")
+    logger.info(f"  - 早停:            patience=7（缩短）")
+    logger.info(f"  - Epochs:          {args.phase1_epochs+1}-{args.epochs}")
     logger.info("=" * 60)
     
     # 加载阶段一的最佳权重
@@ -852,23 +981,40 @@ def main():
     trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
     total = sum(p.numel() for p in model.parameters())
     logger.info(f"可训练参数: {trainable:,} / {total:,} ({trainable/total*100:.1f}%)")
+    logger.info(f"  解冻后新增可训练参数: {trainable - sum(p.numel() for p in model.fc.parameters() if p.requires_grad):,}")
     
-    # 差异化学习率
-    # 分类头（新层）: 较高 LR
-    # layer4（最高层）: 中等 LR
-    # layer3（中高层）: 较低 LR
+    # --- 差异化学习率 + 差异化 Weight Decay ---
+    # 分类头（新层，高 LR + 适中 WD）
+    # layer4（最高层，低 LR + 强化 WD — 特征与品种最相关，容易过拟合）
+    # layer3（中高层，极低 LR + 强化 WD — 半通用特征，只需微调）
     optimizer = optim.AdamW([
-        {"params": model.fc.parameters(),       "lr": args.lr_finetune * 5},
-        {"params": model.layer4.parameters(),   "lr": args.lr_finetune},
-        {"params": model.layer3.parameters(),   "lr": args.lr_finetune * 0.5},
-    ], weight_decay=1e-4)
+        {
+            "params": model.fc.parameters(),
+            "lr": args.lr_finetune * 3,       # 降低：原来 ×5 → ×3
+            "weight_decay": args.weight_decay * 0.5,  # 分类头 WD 减半
+        },
+        {
+            "params": model.layer4.parameters(),
+            "lr": args.lr_finetune * 0.5,      # 降低：原来 ×1.0 → ×0.5
+            "weight_decay": args.weight_decay,          # 强化 WD
+        },
+        {
+            "params": model.layer3.parameters(),
+            "lr": args.lr_finetune * 0.2,      # 降低：原来 ×0.5 → ×0.2
+            "weight_decay": args.weight_decay,          # 强化 WD
+        },
+    ])
     
     scheduler = optim.lr_scheduler.CosineAnnealingLR(
         optimizer, T_max=args.epochs - args.phase1_epochs
     )
     
-    # 早停配置
-    patience = 10
+    # EMA（指数移动平均参数平滑）
+    ema = EMAModel(model, decay=0.999)
+    logger.info(f"EMA 已初始化 (decay=0.999)")
+    
+    # 早停配置（缩短耐心，更快响应过拟合）
+    patience = 7
     no_improve = 0
     best_val_acc_phase2 = best_val_acc
     
@@ -883,14 +1029,28 @@ def main():
         train_loss, train_acc = train_one_epoch(
             model, train_loader, criterion, optimizer,
             device, scaler, epoch, phase2_epochs,
+            max_grad_norm=args.grad_clip,
         )
         
-        # 验证
+        # 更新 EMA shadow
+        ema.update(model)
+        
+        # 验证: 切换到 EMA 参数进行评估
+        ema.apply_shadow(model)
         val_loss, val_acc = validate(model, val_loader, criterion, device)
+        ema.restore(model)
         
         # 更新学习率
         current_lrs = [g["lr"] for g in optimizer.param_groups]
         scheduler.step()
+        
+        # 过拟合检测: train_acc - val_acc 差距
+        acc_gap = train_acc - val_acc
+        gap_warning = ""
+        if acc_gap > 0.10:
+            gap_warning = f" ⚠️ 过拟合严重！(gap={acc_gap*100:.1f}%)"
+        elif acc_gap > 0.05:
+            gap_warning = f" ⚡ 轻微过拟合 (gap={acc_gap*100:.1f}%)"
         
         # 记录
         logger.info(
@@ -899,28 +1059,35 @@ def main():
         logger.info(
             f"  Val   Loss: {val_loss:.4f} | Val   Acc: {val_acc*100:.2f}%"
             f" | LRs: {[f'{lr:.6f}' for lr in current_lrs]}"
+            f" | Gap: {acc_gap*100:.1f}%{gap_warning}"
         )
         
         writer.add_scalar("Phase2/Train_Loss", train_loss, epoch)
         writer.add_scalar("Phase2/Train_Acc", train_acc, epoch)
         writer.add_scalar("Phase2/Val_Loss", val_loss, epoch)
         writer.add_scalar("Phase2/Val_Acc", val_acc, epoch)
+        writer.add_scalar("Phase2/TrainVal_Gap", acc_gap, epoch)
         
-        # 保存最佳模型
+        # 保存最佳模型（使用 EMA 平滑后的权重，泛化能力更强）
         if val_acc > best_val_acc_phase2:
             best_val_acc_phase2 = val_acc
             no_improve = 0
             checkpoint_path = checkpoint_dir / "best_model.pth"
+            
+            # 临时切换到 EMA shadow 权重再保存
+            ema.apply_shadow(model)
             torch.save({
                 "epoch": total_epoch,
-                "model_state_dict": model.state_dict(),
+                "model_state_dict": model.state_dict(),   # EMA 权重
                 "optimizer_state_dict": optimizer.state_dict(),
                 "val_acc": val_acc,
                 "val_loss": val_loss,
                 "class_info": class_info,
                 "gpu_info": {k: str(v) for k, v in gpu_info.items()},
             }, checkpoint_path)
-            logger.info(f"  ✅ 最佳模型已保存: {checkpoint_path}")
+            ema.restore(model)  # 恢复训练权重，继续下一 epoch
+            
+            logger.info(f"  ✅ 最佳模型已保存（EMA 权重）: {checkpoint_path}")
         else:
             no_improve += 1
             logger.info(f"  未提升 ({no_improve}/{patience})")
