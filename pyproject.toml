@@ -13,6 +13,13 @@ dependencies = [
     "selenium>=4.15.0",
     "requests>=2.31.0",
     "pillow>=10.0.0",
+    # PyTorch CUDA 版（GPU 训练支持）。
+    # 注意：PyPI 上的 torch 是 CPU-only 版本，必须指定 PyTorch 官方 CUDA 仓库安装：
+    #   pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu126
+    # Driver 支持 CUDA 12.8，向下兼容 cu126 构建；安装后 torch.cuda.is_available() 应为 True。
+    "torch>=2.12.0",
+    "torchvision>=0.17.0",
+    "torchaudio>=2.12.0",
 ]
 
 [project.optional-dependencies]
