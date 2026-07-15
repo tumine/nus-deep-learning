@@ -961,15 +961,21 @@ def main():
         logger.info("✅ 模型已转换为 channels_last (NHWC) 内存格式")
 
     # torch.compile：算子融合 + 减少 kernel launch overhead
+    # ⚠️  mode="default" 使用 Inductor 后端做算子融合，但不使用 CUDA Graphs
+    #     mode="reduce-overhead" 会捕获 CUDA Graph，但与
+    #     optimizer.zero_grad(set_to_none=True) 不兼容：
+    #     - set_to_none 释放梯度 tensor 后，下一轮 backward 分配新地址
+    #     - CUDA Graph 检测到地址变化 → 每 batch 都失效并重新 capture
+    #     → Phase 2（更多解冻层）会出现 7s/batch 的灾难性退步
     if (
         not args.no_compile
         and gpu_info["cuda_available"]
         and hasattr(torch, "compile")
     ):
         try:
-            model = torch.compile(model, mode="reduce-overhead")
-            logger.info("✅ torch.compile 已启用（mode=reduce-overhead）"
-                        " — 首次迭代会较慢（编译），后续 epoch 显著加速")
+            model = torch.compile(model, mode="default")
+            logger.info("✅ torch.compile 已启用（mode=default / Inductor 内核融合）"
+                        " — 首次迭代会较慢（编译），后续 epoch 加速")
         except Exception as e:
             logger.warning(f"⚠️  torch.compile 启用失败，回退到 eager 模式: {e}")
 
@@ -1074,7 +1080,16 @@ def main():
     logger.info("  - 分类头:           训练 🔥")
     logger.info(f"  - 学习率:           差异化 LR")
     logger.info(f"  - EMA:               decay=0.999 ✅")
+    logger.info(f"  - torch.compile:     Phase 2 首个 batch 需重新 trace（约 10-20s）")
     logger.info("=" * 60)
+
+    # 阶段间重置 torch.compile 状态，确保 Phase 2 的编译从干净状态开始
+    # （Phase 2 解冻更多层后计算图不同，旧的编译缓存会失效）
+    if not args.no_compile and gpu_info["cuda_available"]:
+        try:
+            torch.compiler.reset()
+        except Exception:
+            pass  # PyTorch < 2.1 没有这个 API
 
     # 加载阶段一最佳权重
     best_phase1_path = checkpoint_dir / "best_phase1.pth"
@@ -1109,27 +1124,48 @@ def main():
     logger.info(f"可训练参数: {trainable:,} / {total:,} ({trainable/total*100:.1f}%)")
 
     # 差异化学习率
-    optimizer = optim.AdamW([
+    # ⚠️ 将 generator 显式转为 list，避免：
+    #     1. generator 耗尽后空参数组导致 torch.compile 行为异常
+    #     2. 与 AdamW 的 param_groups 内部迭代行为冲突
+    if args.backbone.startswith("convnext"):
+        group_high = [p for n, p in model.named_parameters()
+                       if "features.7" in n and p.requires_grad]
+        group_mid = [p for n, p in model.named_parameters()
+                      if ("features.6" in n or "features.5" in n or "features.4" in n)
+                      and p.requires_grad]
+    elif args.backbone.startswith("efficientnet"):
+        group_high = [p for n, p in model.named_parameters()
+                       if "features.7" in n and p.requires_grad]
+        group_mid = [p for n, p in model.named_parameters()
+                      if ("features.6" in n or "features.5" in n)
+                      and p.requires_grad]
+    else:  # ResNet
+        group_high = [p for n, p in model.named_parameters()
+                       if "layer4" in n and p.requires_grad]
+        group_mid = [p for n, p in model.named_parameters()
+                      if ("layer3" in n or "layer2" in n)
+                      and p.requires_grad]
+
+    param_groups = [
         {
             "params": getattr(model, head_attr).parameters(),
             "lr": args.lr_finetune * 3,
             "weight_decay": args.weight_decay * 0.5,
         },
-        {
-            "params": (p for n, p in model.named_parameters()
-                        if "features.7" in n or "layer4" in n),
+    ]
+    if group_high:
+        param_groups.append({
+            "params": group_high,
             "lr": args.lr_finetune * 0.5,
             "weight_decay": args.weight_decay,
-        },
-        {
-            "params": (p for n, p in model.named_parameters()
-                        if ("features.6" in n or "features.5" in n or
-                            "features.4" in n or "layer3" in n or "layer2" in n)
-                        and p.requires_grad),
+        })
+    if group_mid:
+        param_groups.append({
+            "params": group_mid,
             "lr": args.lr_finetune * 0.2,
             "weight_decay": args.weight_decay,
-        },
-    ])
+        })
+    optimizer = optim.AdamW(param_groups)
 
     scheduler = CosineWarmupScheduler(
         optimizer, warmup_epochs=min(args.warmup_epochs, 3),
