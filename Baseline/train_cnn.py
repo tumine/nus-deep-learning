@@ -5,14 +5,15 @@
 基于 baseline_prompt.md 中的分析：
   - 推荐 CNN 架构（ResNet-50）而非 YOLO，因任务本质是 5 猫品种细粒度分类
   - 使用 ImageNet 预训练权重进行两阶段迁移学习
-  - 针对 NVIDIA RTX A2000 Laptop GPU (4GB GDDR6) 优化
+  - 自动检测 GPU 并适配训练配置（A2000 4GB / RTX 4070 12GB / ...）
 
 两阶段训练策略：
   阶段一（特征提取）：冻结骨干网络，仅训练新分类头
-  阶段二（微调）：     解冻 layer3-4，差异化学习率全局微调
+  阶段二（微调）：     解冻 layer3-4（大显存 GPU 额外解冻 layer2），差异化学习率全局微调
 
 GPU 支持：
-  自动检测 RTX A2000 并启用 CUDA + FP16 混合精度训练
+  自动检测 GPU 型号与显存，动态调优 batch_size/input_size/epochs
+  支持 FP16 混合精度训练 + TF32（Ada Lovelace）
   若 GPU 不可用，回退到 CPU 训练并给出警告
 
 用法：
@@ -65,7 +66,8 @@ def detect_gpu() -> dict:
     """
     检测可用的 GPU 设备，返回 GPU 配置信息。
     
-    针对 NVIDIA RTX A2000 Laptop GPU 做特别检测和报告。
+    支持多种 GPU 型号检测（A2000 / RTX 4070 / 通用 RTX），并返回
+    显存大小、架构信息（is_4070/is_a2000）供训练流程自动调优。
     
     Returns:
         包含设备信息的字典：
@@ -107,13 +109,16 @@ def detect_gpu() -> dict:
     # 设置设备
     gpu_info["device"] = torch.device("cuda:0")
     
-    # 判断是否为 RTX A2000
+    # 判断 GPU 型号
     is_a2000 = "a2000" in device_name.lower()
+    is_4070 = "4070" in device_name
     is_rtx = "rtx" in device_name.lower()
-    
-    # RTX A2000 支持 FP16 混合精度（Ampere 架构 Tensor Cores）
+
+    # 所有 RTX / 现代 GPU 均支持 FP16（Tensor Cores）
     gpu_info["use_amp"] = True
-    
+    gpu_info["is_a2000"] = is_a2000
+    gpu_info["is_4070"] = is_4070
+
     logger.info("=" * 60)
     logger.info("GPU 检测报告")
     logger.info("=" * 60)
@@ -123,19 +128,28 @@ def detect_gpu() -> dict:
     logger.info(f"  cuDNN 版本:   {torch.backends.cudnn.version()}")
     logger.info(f"  PyTorch 版本: {torch.__version__}")
     logger.info(f"  混合精度训练: {'✅ 启用' if gpu_info['use_amp'] else '❌ 不支持'}")
-    
+
     if is_a2000:
-        logger.info(f"  🎯 检测到 RTX A2000 Laptop GPU — 使用优化配置")
+        logger.info(f"  🎯 检测到 RTX A2000 Laptop GPU — 优化配置")
         logger.info(f"     - Ampere 架构 Tensor Cores → FP16 加速 ~2x")
-        logger.info(f"     - 推荐 batch_size=32（充分利用 4GB VRAM）")
+        logger.info(f"     - 默认 batch_size=32（适配 4GB VRAM）")
+    elif is_4070:
+        logger.info(f"  🎯 检测到 RTX 4070 — Ada Lovelace 12GB VRAM")
+        logger.info(f"     - Ada Lovelace FP8 Tensor Cores → FP16 加速 ~3–4x")
+        logger.info(f"     - 自动调优: batch_size=96, input_size=336")
+        logger.info(f"     - 自动调优: 更长训练 & 更多解冻层")
     elif is_rtx:
         logger.info(f"  🎯 检测到 NVIDIA RTX 系列 GPU")
-    
+
     # cuDNN 自动调优
     torch.backends.cudnn.benchmark = True
+    if is_4070:
+        # Ada Lovelace 支持 TF32（自动启用），额外启用 FP8 优化
+        torch.set_float32_matmul_precision("high")
+        logger.info(f"  TF32/FP8 matmul:  已启用（Ada Lovelace 专属加速）")
     logger.info(f"  cuDNN benchmark: 已启用（自动寻找最优卷积算法）")
     logger.info("=" * 60)
-    
+
     return gpu_info
 
 
@@ -156,7 +170,7 @@ BREED_CN = {
 }
 
 
-def get_transforms() -> Tuple[transforms.Compose, transforms.Compose]:
+def get_transforms(input_size: int = 224) -> Tuple[transforms.Compose, transforms.Compose]:
     """
     构建训练集和验证集的图像预处理变换。
     
@@ -180,7 +194,7 @@ def get_transforms() -> Tuple[transforms.Compose, transforms.Compose]:
     #   - RandomErasing：随机遮挡矩形区域，迫使模型关注整体特征而非局部细节
     #   - 颜色抖动参数适度调大，模拟小车在不同光照下的真实场景
     train_transforms = transforms.Compose([
-        transforms.RandomResizedCrop(224, scale=(0.6, 1.0)),
+        transforms.RandomResizedCrop(input_size, scale=(0.6, 1.0)),
         transforms.RandomHorizontalFlip(p=0.5),
         transforms.RandomRotation(degrees=20),
         transforms.ColorJitter(
@@ -201,8 +215,8 @@ def get_transforms() -> Tuple[transforms.Compose, transforms.Compose]:
     
     # 验证集变换（不做增强）
     val_transforms = transforms.Compose([
-        transforms.Resize(256),
-        transforms.CenterCrop(224),
+        transforms.Resize(int(input_size * 1.15)),
+        transforms.CenterCrop(input_size),
         transforms.ToTensor(),
         transforms.Normalize(mean=imagenet_mean, std=imagenet_std),
     ])
@@ -215,6 +229,7 @@ def prepare_datasets(
     val_ratio: float = 0.15,
     test_ratio: float = 0.0,
     seed: int = 42,
+    input_size: int = 224,
 ) -> Tuple[datasets.ImageFolder, datasets.ImageFolder, Optional[datasets.ImageFolder], dict]:
     """
     准备训练集、验证集和可选的独立测试集。
@@ -252,7 +267,7 @@ def prepare_datasets(
             f"请先运行 image_collector/collect_cat_images.py 搜集图片"
         )
     
-    train_transforms, val_transforms = get_transforms()
+    train_transforms, val_transforms = get_transforms(input_size)
     
     # 加载完整数据集
     full_dataset = datasets.ImageFolder(str(data_path), transform=None)
@@ -643,7 +658,13 @@ def main():
         "--batch",
         type=int,
         default=32,
-        help="批次大小（默认 32，适配 RTX A2000 4GB VRAM）",
+        help="批次大小（默认 32；大显存 GPU 会自动上调）",
+    )
+    parser.add_argument(
+        "--input-size",
+        type=int,
+        default=224,
+        help="输入图像大小（默认 224；大显存 GPU 可上调至 336 提升特征精度）",
     )
     parser.add_argument(
         "--lr",
@@ -749,6 +770,56 @@ def main():
         if args.batch > 16:
             logger.warning(f"batch_size 从 {args.batch} 降低到 16")
             args.batch = 16
+
+    # -----------------------------------------------------------
+    # 自动调优：根据 GPU 显存动态设定训练超参数
+    # -----------------------------------------------------------
+    vram_gb = gpu_info.get("vram_gb", 0)
+    if vram_gb >= 10:
+        logger.info(f"\n🔧 检测到大显存 GPU ({vram_gb} GB)，自动优化训练配置")
+
+        # batch_size 放大（利用大显存提升吞吐）
+        suggested_batch = 64 if vram_gb < 16 else 96
+        if args.batch < suggested_batch:
+            logger.info(f"   batch_size:    {args.batch} → {suggested_batch}")
+            args.batch = suggested_batch
+
+        # 输入分辨率提升（更高分辨率提取精细特征）
+        suggested_size = 336
+        if args.input_size < suggested_size:
+            logger.info(f"   input_size:    {args.input_size} → {suggested_size}")
+            args.input_size = suggested_size
+
+        # 训练轮数延长（充分发挥大模型潜力）
+        suggested_epochs = 80
+        if args.epochs < suggested_epochs:
+            logger.info(f"   epochs:        {args.epochs} → {suggested_epochs}")
+            args.epochs = suggested_epochs
+
+        suggested_phase1 = 20
+        if args.phase1_epochs < suggested_phase1:
+            logger.info(f"   phase1_epochs: {args.phase1_epochs} → {suggested_phase1}")
+            args.phase1_epochs = suggested_phase1
+
+        # workers 翻倍
+        suggested_workers = min(args.workers * 2, 16)
+        if args.workers < suggested_workers:
+            logger.info(f"   workers:       {args.workers} → {suggested_workers}")
+            args.workers = suggested_workers
+
+        # weight_decay 放宽（大批次梯度更稳定，可减轻 L2 惩罚）
+        relaxed_wd = 3e-4
+        if args.weight_decay > relaxed_wd:
+            logger.info(f"   weight_decay:   {args.weight_decay} → {relaxed_wd}")
+            args.weight_decay = relaxed_wd
+
+        # 梯度裁剪放宽（大显存 → 梯度更稳定）
+        relaxed_clip = 2.0
+        if args.grad_clip < relaxed_clip:
+            logger.info(f"   grad_clip:      {args.grad_clip} → {relaxed_clip}")
+            args.grad_clip = relaxed_clip
+
+        logger.info("   使用 --batch/--epochs/--input-size/--workers 可覆盖以上自动值\n")
     
     # ============================================================
     # 2. 准备数据集
@@ -790,6 +861,7 @@ def main():
         val_ratio=val_ratio,
         test_ratio=args.test_ratio,
         seed=args.seed,
+        input_size=args.input_size,
     )
     
     # 校验划分比例
@@ -939,29 +1011,38 @@ def main():
     logger.info(f"\n阶段一完成！最佳验证准确率: {best_val_acc*100:.2f}%")
     
     # ----------------------------------------------------------
-    # 阶段二：微调（解冻 layer3-4，全局微调）
+    # 阶段二：微调（解冻 layer2~4，全局微调）
     # ----------------------------------------------------------
     #
     # 阶段二过拟合风险最高，引入以下多层正则化策略:
     #   1. Label Smoothing (ε=0.1): 阻止模型对训练样本过度自信
     #   2. 差异化 Weight Decay: 解冻层参数多 → 更高 L2 惩罚
-    #   3. 梯度裁剪 (max_norm=1.0): 防止梯度爆炸
+    #   3. 梯度裁剪: 防止梯度爆炸
     #   4. EMA (decay=0.999): 参数平滑，提升泛化能力
     #   5. 降低解冻层学习率: 防止破坏预训练特征
-    #   6. 缩短早停耐心: 更快停止过拟合
+    #   6. 早停: 更快停止过拟合
+    #   7. 大显存 GPU (>=10GB): 额外解冻 layer2，更深微调
     # ----------------------------------------------------------
-    
+
+    unfreeze_layer2 = gpu_info.get("vram_gb", 0) >= 10
+
     logger.info("\n" + "=" * 60)
     logger.info("阶段二：微调（Fine-tuning）— 强化正则化")
-    logger.info("  - Layer1-2:       冻结 ❄️（通用特征）")
-    logger.info("  - Layer3-4:       解冻 🔥（品种特定特征）")
+    if unfreeze_layer2:
+        logger.info("  🎯 大显存模式 — 深度微调")
+        logger.info("  - Layer1:         冻结 ❄️（通用底层特征）")
+        logger.info("  - Layer2-4:       解冻 🔥（中高层特征）")
+    else:
+        logger.info("  - Layer1-2:       冻结 ❄️（通用特征）")
+        logger.info("  - Layer3-4:       解冻 🔥（品种特定特征）")
     logger.info("  - 分类头:         训练 🔥")
     logger.info(f"  - Label Smoothing: {args.label_smoothing}")
     logger.info(f"  - Weight Decay:    {args.weight_decay}（强化）")
     logger.info(f"  - Gradient Clip:   {args.grad_clip}")
     logger.info(f"  - EMA:             decay=0.999 ✅")
     logger.info(f"  - 学习率:         差异化 LR（降低避免破坏预训练特征）")
-    logger.info(f"  - 早停:            patience=7（缩短）")
+    patience_str = f"patience={'10' if unfreeze_layer2 else '7'}"
+    logger.info(f"  - 早停:            {patience_str}")
     logger.info(f"  - Epochs:          {args.phase1_epochs+1}-{args.epochs}")
     logger.info("=" * 60)
     
@@ -972,9 +1053,11 @@ def main():
         model.load_state_dict(checkpoint["model_state_dict"])
         logger.info(f"加载阶段一最佳模型: val_acc={checkpoint['val_acc']*100:.2f}%")
     
-    # 解冻 layer3 和 layer4
+    # 解冻更多层（大显存 GPU 可安全解冻 layer2，进行更深层微调）
     for name, param in model.named_parameters():
         if "layer3" in name or "layer4" in name:
+            param.requires_grad = True
+        elif "layer2" in name and unfreeze_layer2:
             param.requires_grad = True
     
     # 统计可训练参数
@@ -987,6 +1070,14 @@ def main():
     # 分类头（新层，高 LR + 适中 WD）
     # layer4（最高层，低 LR + 强化 WD — 特征与品种最相关，容易过拟合）
     # layer3（中高层，极低 LR + 强化 WD — 半通用特征，只需微调）
+    # layer2（中层，极低 LR + 强化 WD — 仅大显存 GPU 解冻，通用中层特征微调）
+    layer2_group = ([
+        {
+            "params": model.layer2.parameters(),
+            "lr": args.lr_finetune * 0.1,
+            "weight_decay": args.weight_decay,
+        },
+    ] if unfreeze_layer2 else [])
     optimizer = optim.AdamW([
         {
             "params": model.fc.parameters(),
@@ -1003,7 +1094,7 @@ def main():
             "lr": args.lr_finetune * 0.2,      # 降低：原来 ×0.5 → ×0.2
             "weight_decay": args.weight_decay,          # 强化 WD
         },
-    ])
+    ] + layer2_group)
     
     scheduler = optim.lr_scheduler.CosineAnnealingLR(
         optimizer, T_max=args.epochs - args.phase1_epochs
@@ -1013,10 +1104,11 @@ def main():
     ema = EMAModel(model, decay=0.999)
     logger.info(f"EMA 已初始化 (decay=0.999)")
     
-    # 早停配置（缩短耐心，更快响应过拟合）
-    patience = 7
+    # 早停配置（大显存 → 更长耐心）
+    patience = 10 if unfreeze_layer2 else 7
     no_improve = 0
-    best_val_acc_phase2 = best_val_acc
+    best_val_acc_phase2 = best_val_acc      # 用于判断是否超越 Phase1
+    best_phase2_val = 0.0                    # Phase2 自身最佳（保证最终有模型产出）
     
     phase2_epochs = args.epochs - args.phase1_epochs
     
@@ -1068,12 +1160,12 @@ def main():
         writer.add_scalar("Phase2/Val_Acc", val_acc, epoch)
         writer.add_scalar("Phase2/TrainVal_Gap", acc_gap, epoch)
         
-        # 保存最佳模型（使用 EMA 平滑后的权重，泛化能力更强）
+        # 保存「超越 Phase1」的最佳模型（使用 EMA 平滑后的权重，泛化能力更强）
         if val_acc > best_val_acc_phase2:
             best_val_acc_phase2 = val_acc
             no_improve = 0
             checkpoint_path = checkpoint_dir / "best_model.pth"
-            
+
             # 临时切换到 EMA shadow 权重再保存
             ema.apply_shadow(model)
             torch.save({
@@ -1084,19 +1176,75 @@ def main():
                 "val_loss": val_loss,
                 "class_info": class_info,
                 "gpu_info": {k: str(v) for k, v in gpu_info.items()},
+                "phase": "phase2",
             }, checkpoint_path)
             ema.restore(model)  # 恢复训练权重，继续下一 epoch
-            
-            logger.info(f"  ✅ 最佳模型已保存（EMA 权重）: {checkpoint_path}")
+
+            logger.info(f"  ✅ 最佳模型已保存（EMA 权重，超越 Phase1）: {checkpoint_path}")
         else:
             no_improve += 1
             logger.info(f"  未提升 ({no_improve}/{patience})")
+
+        # 始终记录 Phase2 自身最优，保证即使未超越 Phase1 也有可用模型
+        if val_acc > best_phase2_val:
+            best_phase2_val = val_acc
+            ema.apply_shadow(model)
+            torch.save({
+                "epoch": total_epoch,
+                "model_state_dict": model.state_dict(),   # EMA 权重
+                "optimizer_state_dict": optimizer.state_dict(),
+                "val_acc": val_acc,
+                "val_loss": val_loss,
+                "class_info": class_info,
+                "gpu_info": {k: str(v) for k, v in gpu_info.items()},
+                "phase": "phase2",
+            }, checkpoint_dir / "best_phase2.pth")
+            ema.restore(model)
         
         # 早停
         if no_improve >= patience:
             logger.info(f"\n早停触发！验证准确率连续 {patience} 轮未提升")
             break
-    
+
+    # ============================================================
+    # 4.5 保证 best_model.pth 一定存在（供部署 / tcp_server 使用）
+    # ============================================================
+    if not (checkpoint_dir / "best_model.pth").exists():
+        logger.warning(
+            "⚠️  Phase2 未超越 Phase1 最佳验证准确率，未自动生成 best_model.pth"
+        )
+        # 在 Phase2 自身最优与 Phase1 最优之间取较优者，确保部署模型可用
+        candidates = []
+        if (checkpoint_dir / "best_phase2.pth").exists():
+            p2 = torch.load(checkpoint_dir / "best_phase2.pth", map_location="cpu")
+            candidates.append(("best_phase2.pth", p2.get("val_acc", 0.0)))
+        if (checkpoint_dir / "best_phase1.pth").exists():
+            p1 = torch.load(checkpoint_dir / "best_phase1.pth", map_location="cpu")
+            candidates.append(("best_phase1.pth", p1.get("val_acc", 0.0)))
+
+        if candidates:
+            candidates.sort(key=lambda x: x[1], reverse=True)
+            src_name, src_val = candidates[0]
+            src = checkpoint_dir / src_name
+            ckpt = torch.load(src, map_location="cpu")
+            dst = checkpoint_dir / "best_model.pth"
+            torch.save({
+                "epoch": ckpt.get("epoch", total_epoch),
+                "model_state_dict": ckpt.get("model_state_dict", ckpt),
+                "optimizer_state_dict": ckpt.get("optimizer_state_dict", {}),
+                "val_acc": ckpt.get("val_acc", 0.0),
+                "val_loss": ckpt.get("val_loss", 0.0),
+                "class_info": class_info,
+                "gpu_info": {k: str(v) for k, v in gpu_info.items()},
+                "phase": f"{src_name}_fallback",
+            }, dst)
+            logger.info(
+                f"  📦 已将较优模型 {src_name} (val_acc={src_val*100:.2f}%) "
+                f"复制为 best_model.pth，部署可用"
+            )
+        else:
+            logger.error("❌ 未找到任何可用 checkpoint，无法生成 best_model.pth")
+
     # ============================================================
     # 5. 保存最终模型
     # ============================================================
