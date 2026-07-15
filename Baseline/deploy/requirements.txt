@@ -1,0 +1,24 @@
+# 猫品种识别模型 — 部署依赖
+# 安装: pip install -r deploy/requirements.txt
+
+# Web 框架
+fastapi>=0.110.0
+uvicorn[standard]>=0.27.0
+python-multipart>=0.0.9
+pydantic>=2.0.0
+
+# 推理后端（三选一即可）
+# 1) PyTorch（GPU 推理，需要 CUDA 版本的 torch）
+torch>=2.0.0
+torchvision>=0.15.0
+
+# 2) ONNX Runtime（CPU/GPU 通用，更轻量）
+# onnxruntime-gpu>=1.15.0    # GPU 版
+# onnxruntime>=1.15.0        # CPU 版
+
+# 图像处理
+pillow>=10.0.0
+numpy>=1.24.0
+
+# 客户端（可选，调用 API 用）
+requests>=2.31.0

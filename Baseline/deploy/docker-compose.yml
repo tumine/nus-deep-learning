@@ -1,0 +1,60 @@
+# 猫品种识别 — Docker Compose 部署
+# 启动: docker compose up -d
+# 停止: docker compose down
+
+version: "3.8"
+
+services:
+  # ===== GPU 推理服务 (PyTorch) =====
+  cat-breed-api-gpu:
+    build:
+      context: ..
+      dockerfile: deploy/Dockerfile
+      target: gpu
+    image: cat-breed-api:gpu
+    container_name: cat-breed-api-gpu
+    ports:
+      - "8000:8000"
+    volumes:
+      # 挂载模型文件目录（修改为你的实际路径）
+      - ../outputs:/models:ro
+    command:
+      - "--model"
+      - "/models/resnet50_cat_20240701_120000/checkpoints/best_model.pth"
+      - "--backend"
+      - "pytorch"
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 60s
+
+  # ===== CPU 推理服务 (ONNX Runtime, 无 GPU 时使用) =====
+  cat-breed-api-cpu:
+    build:
+      context: ..
+      dockerfile: deploy/Dockerfile
+      target: cpu
+    image: cat-breed-api:cpu
+    container_name: cat-breed-api-cpu
+    ports:
+      - "8001:8000"
+    volumes:
+      - ../outputs:/models:ro
+    command:
+      - "--model"
+      - "/models/resnet50_cat_20240701_120000/resnet50_cat.onnx"
+      - "--backend"
+      - "onnx"
+    restart: unless-stopped
+    profiles:
+      - cpu  # 需要显式启用: docker compose --profile cpu up
