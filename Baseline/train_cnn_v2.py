@@ -249,7 +249,9 @@ def prepare_datasets(
     if not data_path.exists():
         raise FileNotFoundError(
             f"数据目录不存在: {data_path}\n"
-            f"请先运行 image_collector/collect_cat_images.py 搜集图片"
+            f"请先运行以下脚本搜集图片：\n"
+            f"  猫品种图片: image_collector/collect_cat_images.py\n"
+            f"  随机非猫图片: image_collector/collect_random_images.py"
         )
 
     train_transforms, val_transforms = get_transforms(input_size)
@@ -257,23 +259,22 @@ def prepare_datasets(
     total_size = len(full_dataset)
 
     logger.info("\n数据集目录结构:")
-    # 列出所有子目录（包括可能存在的 other/）
-    all_dirs = list(CAT_BREEDS_SORTED)
-    other_dir = data_path / "other"
-    if other_dir.exists() and other_dir.is_dir():
-        if "other" not in all_dirs:
-            all_dirs.append("other")
-    for breed in all_dirs:
+    # 使用 ImageFolder 实际发现的类别（字母序），而非硬编码列表
+    actual_classes = full_dataset.classes
+    unknown_dirs = [c for c in actual_classes
+                    if c not in CAT_BREEDS_SORTED and c != "other"]
+    if unknown_dirs:
+        logger.warning(
+            f"  ⚠️  发现未知目录将被作为独立类别训练: {unknown_dirs}\n"
+            f"     如果这是意外，请删除或合并这些目录后重新训练！"
+        )
+    for breed in actual_classes:
         breed_dir = data_path / breed
-        if breed_dir.exists():
-            count = len(list(breed_dir.glob("*.[jJ][pP][gG]")))
-            count += len(list(breed_dir.glob("*.[pP][nN][gG]")))
-            cn_name = BREED_CN.get(breed, breed)
-            extra = " 🚫 非猫拒识类" if breed == "other" else ""
-            logger.info(f"  {breed}/ ({cn_name}): {count} 张{extra}")
-        else:
-            if breed != "other":
-                logger.warning(f"  ⚠️ {breed}/ 目录不存在！")
+        count = len(list(breed_dir.glob("*.[jJ][pP][gG]")))
+        count += len(list(breed_dir.glob("*.[pP][nN][gG]")))
+        cn_name = BREED_CN.get(breed, breed)
+        tag = " 🐱" if breed in CAT_BREEDS_SORTED else (" 🚫 非猫拒识类" if breed == "other" else " ❓ 未知类")
+        logger.info(f"  {breed}/ ({cn_name}): {count} 张{tag}")
 
     generator = torch.Generator().manual_seed(seed)
     test_dataset = None
@@ -987,6 +988,7 @@ def main():
                 "optimizer_state_dict": optimizer.state_dict(),
                 "val_acc": val_acc,
                 "val_loss": val_loss,
+                "class_info": class_info,
             }, checkpoint_path)
             logger.info(f"  ✅ 最佳模型已保存: {checkpoint_path}")
 

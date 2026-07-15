@@ -253,7 +253,12 @@ class CatBreedClassifier:
         class_info = checkpoint.get("class_info")
         if class_info and "classes" in class_info:
             self.class_names = class_info["classes"]
-            logger.info(f"从 checkpoint 加载类别: {self.class_names}")
+            self._has_other_class = "other" in self.class_names
+            self._cat_indices = [
+                i for i, name in enumerate(self.class_names) if name != "other"
+            ]
+            logger.info(f"从 checkpoint 加载类别: {self.class_names}"
+                        + (" (含拒识类)" if self._has_other_class else ""))
         num_classes = len(self.class_names)
         dropout_p = 0.5  # 默认值
 
