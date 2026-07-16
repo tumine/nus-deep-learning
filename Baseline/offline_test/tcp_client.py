@@ -127,6 +127,20 @@ class TcpBreedClient:
         """建立 TCP 连接。"""
         self._sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         self._sock.settimeout(RECV_TIMEOUT)
+
+        # 启用 TCP Keep-Alive，防止空闲连接被防火墙/NAT 丢弃
+        self._sock.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
+        # Windows 和 Linux 的 keepalive 参数配置方式不同
+        try:
+            # Linux: TCP_KEEPIDLE, TCP_KEEPINTVL, TCP_KEEPCNT
+            self._sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPIDLE, 60)
+            self._sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPINTVL, 10)
+            self._sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPCNT, 5)
+        except (AttributeError, OSError):
+            # Windows 下自动使用系统默认的 keepalive 参数
+            # （默认空闲 2 小时后才开始探测，可通过注册表调整）
+            pass
+
         self._sock.connect((self.host, self.port))
         logger.info(f"已连接: {self.host}:{self.port}")
 
