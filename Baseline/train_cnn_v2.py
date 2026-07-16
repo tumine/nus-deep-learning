@@ -209,27 +209,49 @@ def get_transforms(input_size: int = 384) -> Tuple[transforms.Compose, transform
     构建训练集和验证集的图像预处理变换。
 
     训练集使用增强的数据增强策略：
-    - RandAugment 风格的自动增强
-    - RandomErasing 随机遮挡
-    - 更强的颜色抖动和几何变换
+    - RandomResizedCrop: 随机裁剪 + 缩放 (0.5~1.0x)
+    - RandomHorizontalFlip / RandomVerticalFlip: 水平/垂直翻转
+    - RandomRotation: 随机旋转 (±30°)
+    - RandomAffine: 平移 + 缩放 (0.85~1.15x) + 剪切（扭曲效果）
+    - RandomPerspective: 透视扭曲 (distortion_scale=0.4)
+    - ColorJitter: 颜色抖动（亮度/对比度/饱和度/色调）
+    - RandomGrayscale: 随机灰度化
+    - GaussianBlur: 高斯模糊 (kernel=5, sigma=0.1~2.0)
+    - RandomErasing: 随机遮挡擦除
+    - Normalize: ImageNet 均值/标准差归一化
 
-    验证集仅使用中心裁剪 + 归一化。
+    验证集仅使用 Resize → CenterCrop → 归一化。
     """
     imagenet_mean = [0.485, 0.456, 0.406]
     imagenet_std = [0.229, 0.224, 0.225]
 
     # 训练集增强 — 针对细粒度分类的强化策略
+    # 变换顺序遵循最佳实践：几何变换 → 颜色变换 → 模糊 → ToTensor → 擦除 → 归一化
     train_transforms = transforms.Compose([
+        # ---- 几何变换（Geometric Augmentations）----
         transforms.RandomResizedCrop(input_size, scale=(0.5, 1.0)),
         transforms.RandomHorizontalFlip(p=0.5),
-        transforms.RandomRotation(degrees=25),
+        transforms.RandomVerticalFlip(p=0.3),                          # 垂直翻转
+        transforms.RandomRotation(degrees=30),                          # 旋转（增大到 ±30°）
+        transforms.RandomAffine(
+            degrees=0, translate=(0.2, 0.2),                          # 平移
+            scale=(0.85, 1.15),                                         # 缩放
+            shear=(-10, 10, -10, 10),                                  # 剪切（扭曲效果）
+        ),
+        transforms.RandomPerspective(
+            distortion_scale=0.4, p=0.3,                               # 透视扭曲（增强）
+        ),
+        # ---- 颜色/风格变换（Color Augmentations）----
         transforms.ColorJitter(
             brightness=0.35, contrast=0.35, saturation=0.35, hue=0.1,
         ),
-        transforms.RandomAffine(degrees=0, translate=(0.2, 0.2)),
         transforms.RandomGrayscale(p=0.1),
-        transforms.RandomPerspective(distortion_scale=0.3, p=0.3),
+        # ---- 模糊变换（Blurring Augmentations）----
+        transforms.GaussianBlur(
+            kernel_size=5, sigma=(0.1, 2.0),                           # 高斯模糊
+        ),
         transforms.ToTensor(),
+        # ---- Tensor 级增强（必须位于 ToTensor 之后）----
         transforms.RandomErasing(
             p=0.25, scale=(0.02, 0.15), ratio=(0.3, 3.3),
         ),
