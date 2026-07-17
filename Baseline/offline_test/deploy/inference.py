@@ -38,11 +38,11 @@ logger = logging.getLogger(__name__)
 _DEFAULT_CAT_BREEDS = ["pallas", "persian", "ragdoll", "singapura", "sphynx"]
 
 BREED_CN = {
-    "pallas": "兔狲",
-    "persian": "波斯猫",
-    "ragdoll": "布偶猫",
-    "singapura": "新加坡猫",
-    "sphynx": "斯芬克斯猫",
+    "pallas": "Pallas's Cat",
+    "persian": "Persian",
+    "ragdoll": "Ragdoll",
+    "singapura": "Singapura",
+    "sphynx": "Sphynx",
 }
 
 
@@ -566,7 +566,7 @@ class CatBreedClassifier:
         return InferenceResult(
             class_id=pred_idx,
             class_name=pred_name,
-            class_name_cn=BREED_CN.get(pred_name, "非猫/其他"),
+            class_name_cn=BREED_CN.get(pred_name, "Non-cat / Other"),
             confidence=confidence,
             top5_probs=top5,
             latency_ms=latency_ms,

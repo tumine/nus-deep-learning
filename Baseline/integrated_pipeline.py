@@ -165,19 +165,19 @@ def print_result(result, image_name: str = ""):
         print(f"\n{'=' * 55}")
         if image_name:
             print(f"📷 {image_name}")
-        print(f"  🚫 判定为非猫图片（最高置信度不足阈值）")
-        print(f"  📊 最高概率: {result.confidence * 100:.2f}%")
-        print(f"  ⏱️  推理耗时: {result.latency_ms:.2f} ms")
+        print(f"  🚫 Detected as non-cat (confidence below threshold)")
+        print(f"  📊 Max probability: {result.confidence * 100:.2f}%")
+        print(f"  ⏱️  Inference time: {result.latency_ms:.2f} ms")
         print(f"{'=' * 55}")
         return
 
     print(f"\n{'=' * 55}")
     if image_name:
         print(f"📷 {image_name}")
-    print(f"  🐱 识别结果: {result.class_name_cn} ({result.class_name})")
-    print(f"  📊 置信度:   {result.confidence * 100:.2f}%")
-    print(f"  ⏱️  推理耗时: {result.latency_ms:.2f} ms")
-    print(f"\n  Top-5 概率分布:")
+    print(f"  🐱 Result: {result.class_name_cn} ({result.class_name})")
+    print(f"  📊 Confidence: {result.confidence * 100:.2f}%")
+    print(f"  ⏱️  Inference time: {result.latency_ms:.2f} ms")
+    print(f"\n  Top-5 Probability Distribution:")
     for item in result_dict.get("top5", []):
         bar = "█" * max(1, int(item["probability"] * 30))
         marker = " ←" if item["rank"] == 1 else ""
