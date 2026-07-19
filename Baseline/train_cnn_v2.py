@@ -42,6 +42,8 @@ import torch.optim as optim
 from torch.cuda.amp import GradScaler, autocast
 from torch.utils.data import DataLoader
 from torch.utils.tensorboard import SummaryWriter
+from contextlib import nullcontext
+
 from torchvision import datasets, transforms
 from torchvision.transforms import functional as TF
 
@@ -135,6 +137,7 @@ def detect_gpu() -> dict:
         "name": "CPU",
         "vram_gb": 0,
         "use_amp": False,
+        "use_bf16": False,  # Ada Lovelace+ 启用 bfloat16（无需 GradScaler）
         "cuda_available": False,
     }
 
@@ -155,11 +158,19 @@ def detect_gpu() -> dict:
     gpu_info["device"] = torch.device("cuda:0")
     gpu_info["use_amp"] = True
 
-    # cuDNN 自动调优
+    # === GPU 训练加速配置 ===
+    # 1. cuDNN 自动调优：首次迭代选择最优卷积算法
     torch.backends.cudnn.benchmark = True
-    # Ada Lovelace (RTX 4070) 额外优化
+    # 2. 启用 TF32（RTX 30/40 系列在 Ampere/Ada 架构有硬件加速）
+    torch.backends.cuda.matmul.allow_tf32 = True
+    torch.backends.cudnn.allow_tf32 = True
+    # 3. 大显存 GPU 启用更高 matmul 精度
     if gpu_info["vram_gb"] >= 10:
         torch.set_float32_matmul_precision("high")
+    # 4. 检测 Ada Lovelace（RTX 40 系列）— 启用 bfloat16
+    #    bfloat16 与 fp16 速度相当但动态范围更广，无需 GradScaler
+    if "RTX 40" in device_name or "RTX 50" in device_name or "Ada" in device_name:
+        gpu_info["use_bf16"] = True
 
     logger.info("=" * 60)
     logger.info("GPU 检测报告")
@@ -169,6 +180,8 @@ def detect_gpu() -> dict:
     logger.info(f"  CUDA 版本:    {torch.version.cuda}")
     logger.info(f"  PyTorch 版本: {torch.__version__}")
     logger.info(f"  混合精度训练: {'✅ 启用' if gpu_info['use_amp'] else '❌ 不支持'}")
+    logger.info(f"  BFloat16:     {'✅ 启用（Ada+）' if gpu_info['use_bf16'] else '❌'}")
+    logger.info(f"  TF32:         ✅ 启用")
     logger.info("=" * 60)
 
     return gpu_info
@@ -179,8 +192,7 @@ def detect_gpu() -> dict:
 # ============================================================
 
 # 类别列表 — 注意：ImageFolder 按目录名字母排序，最终顺序由 class_info 决定
-# 实际顺序（字母序）: other(如果有), pallas, persian, ragdoll, singapura, sphynx
-# 如需引入"非猫"类别，创建 other/ 目录并放入随机非猫图片即可自动识别
+# 实际顺序（字母序）: pallas, persian, ragdoll, singapura, sphynx
 CAT_BREEDS_SORTED = ["pallas", "persian", "ragdoll", "singapura", "sphynx"]
 
 BREED_CN = {
@@ -189,7 +201,6 @@ BREED_CN = {
     "ragdoll": "布偶猫",
     "singapura": "新加坡猫",
     "sphynx": "斯芬克斯猫",
-    "other": "非猫/其他",
 }
 
 
@@ -198,27 +209,49 @@ def get_transforms(input_size: int = 384) -> Tuple[transforms.Compose, transform
     构建训练集和验证集的图像预处理变换。
 
     训练集使用增强的数据增强策略：
-    - RandAugment 风格的自动增强
-    - RandomErasing 随机遮挡
-    - 更强的颜色抖动和几何变换
+    - RandomResizedCrop: 随机裁剪 + 缩放 (0.5~1.0x)
+    - RandomHorizontalFlip / RandomVerticalFlip: 水平/垂直翻转
+    - RandomRotation: 随机旋转 (±30°)
+    - RandomAffine: 平移 + 缩放 (0.85~1.15x) + 剪切（扭曲效果）
+    - RandomPerspective: 透视扭曲 (distortion_scale=0.4)
+    - ColorJitter: 颜色抖动（亮度/对比度/饱和度/色调）
+    - RandomGrayscale: 随机灰度化
+    - GaussianBlur: 高斯模糊 (kernel=5, sigma=0.1~2.0)
+    - RandomErasing: 随机遮挡擦除
+    - Normalize: ImageNet 均值/标准差归一化
 
-    验证集仅使用中心裁剪 + 归一化。
+    验证集仅使用 Resize → CenterCrop → 归一化。
     """
     imagenet_mean = [0.485, 0.456, 0.406]
     imagenet_std = [0.229, 0.224, 0.225]
 
     # 训练集增强 — 针对细粒度分类的强化策略
+    # 变换顺序遵循最佳实践：几何变换 → 颜色变换 → 模糊 → ToTensor → 擦除 → 归一化
     train_transforms = transforms.Compose([
+        # ---- 几何变换（Geometric Augmentations）----
         transforms.RandomResizedCrop(input_size, scale=(0.5, 1.0)),
         transforms.RandomHorizontalFlip(p=0.5),
-        transforms.RandomRotation(degrees=25),
+        transforms.RandomVerticalFlip(p=0.3),                          # 垂直翻转
+        transforms.RandomRotation(degrees=30),                          # 旋转（增大到 ±30°）
+        transforms.RandomAffine(
+            degrees=0, translate=(0.2, 0.2),                          # 平移
+            scale=(0.85, 1.15),                                         # 缩放
+            shear=(-10, 10, -10, 10),                                  # 剪切（扭曲效果）
+        ),
+        transforms.RandomPerspective(
+            distortion_scale=0.4, p=0.3,                               # 透视扭曲（增强）
+        ),
+        # ---- 颜色/风格变换（Color Augmentations）----
         transforms.ColorJitter(
             brightness=0.35, contrast=0.35, saturation=0.35, hue=0.1,
         ),
-        transforms.RandomAffine(degrees=0, translate=(0.2, 0.2)),
         transforms.RandomGrayscale(p=0.1),
-        transforms.RandomPerspective(distortion_scale=0.3, p=0.3),
+        # ---- 模糊变换（Blurring Augmentations）----
+        transforms.GaussianBlur(
+            kernel_size=5, sigma=(0.1, 2.0),                           # 高斯模糊
+        ),
         transforms.ToTensor(),
+        # ---- Tensor 级增强（必须位于 ToTensor 之后）----
         transforms.RandomErasing(
             p=0.25, scale=(0.02, 0.15), ratio=(0.3, 3.3),
         ),
@@ -249,9 +282,8 @@ def prepare_datasets(
     if not data_path.exists():
         raise FileNotFoundError(
             f"数据目录不存在: {data_path}\n"
-            f"请先运行以下脚本搜集图片：\n"
-            f"  猫品种图片: image_collector/collect_cat_images.py\n"
-            f"  随机非猫图片: image_collector/collect_random_images.py"
+            f"请先运行脚本搜集图片：\n"
+            f"  image_collector/collect_cat_images.py"
         )
 
     train_transforms, val_transforms = get_transforms(input_size)
@@ -261,8 +293,7 @@ def prepare_datasets(
     logger.info("\n数据集目录结构:")
     # 使用 ImageFolder 实际发现的类别（字母序），而非硬编码列表
     actual_classes = full_dataset.classes
-    unknown_dirs = [c for c in actual_classes
-                    if c not in CAT_BREEDS_SORTED and c != "other"]
+    unknown_dirs = [c for c in actual_classes if c not in CAT_BREEDS_SORTED]
     if unknown_dirs:
         logger.warning(
             f"  ⚠️  发现未知目录将被作为独立类别训练: {unknown_dirs}\n"
@@ -273,7 +304,7 @@ def prepare_datasets(
         count = len(list(breed_dir.glob("*.[jJ][pP][gG]")))
         count += len(list(breed_dir.glob("*.[pP][nN][gG]")))
         cn_name = BREED_CN.get(breed, breed)
-        tag = " 🐱" if breed in CAT_BREEDS_SORTED else (" 🚫 非猫拒识类" if breed == "other" else " ❓ 未知类")
+        tag = " 🐱" if breed in CAT_BREEDS_SORTED else " ❓ 未知类"
         logger.info(f"  {breed}/ ({cn_name}): {count} 张{tag}")
 
     generator = torch.Generator().manual_seed(seed)
@@ -565,6 +596,8 @@ def train_one_epoch(
     max_grad_norm: float = 1.0,
     use_mixup: bool = True,
     mixup_alpha: float = 0.8,
+    use_channels_last: bool = False,
+    use_bf16: bool = False,
 ) -> Tuple[float, float]:
     """训练一个 epoch。"""
     model.train()
@@ -573,8 +606,20 @@ def train_one_epoch(
     total = 0
     start_time = time.time()
 
+    # AMP 上下文：fp16 (scaler) / bf16 / 不用 amp
+    if scaler is not None:
+        amp_ctx = autocast()  # 默认 fp16
+    elif use_bf16:
+        amp_ctx = torch.amp.autocast(device_type="cuda", dtype=torch.bfloat16)
+    else:
+        amp_ctx = nullcontext()
+
     for batch_idx, (images, labels) in enumerate(dataloader):
-        images = images.to(device, non_blocking=True)
+        # 输入与模型保持一致的内存格式（channels_last → NHWC 零拷贝开销）
+        if use_channels_last:
+            images = images.to(device, non_blocking=True, memory_format=torch.channels_last)
+        else:
+            images = images.to(device, non_blocking=True)
         labels = labels.to(device, non_blocking=True)
 
         # MixUp / CutMix
@@ -597,24 +642,22 @@ def train_one_epoch(
 
         optimizer.zero_grad(set_to_none=True)
 
+        with amp_ctx:
+            outputs = model(images)
+            if mixed:
+                loss = mixup_loss(criterion, outputs, labels_a, labels_b, lam)
+            else:
+                loss = criterion(outputs, labels)
+
         if scaler is not None:
-            with autocast():
-                outputs = model(images)
-                if mixed:
-                    loss = mixup_loss(criterion, outputs, labels_a, labels_b, lam)
-                else:
-                    loss = criterion(outputs, labels)
+            # fp16 需要 GradScaler 处理 inf/nan
             scaler.scale(loss).backward()
             scaler.unscale_(optimizer)
             torch.nn.utils.clip_grad_norm_(model.parameters(), max_grad_norm)
             scaler.step(optimizer)
             scaler.update()
         else:
-            outputs = model(images)
-            if mixed:
-                loss = mixup_loss(criterion, outputs, labels_a, labels_b, lam)
-            else:
-                loss = criterion(outputs, labels)
+            # bf16 / fp32 直接反传
             loss.backward()
             torch.nn.utils.clip_grad_norm_(model.parameters(), max_grad_norm)
             optimizer.step()
@@ -647,6 +690,7 @@ def validate(
     dataloader: DataLoader,
     criterion: nn.Module,
     device: torch.device,
+    use_channels_last: bool = False,
 ) -> Tuple[float, float]:
     """在验证集上评估模型。"""
     model.eval()
@@ -655,7 +699,10 @@ def validate(
     total = 0
 
     for images, labels in dataloader:
-        images = images.to(device, non_blocking=True)
+        if use_channels_last:
+            images = images.to(device, non_blocking=True, memory_format=torch.channels_last)
+        else:
+            images = images.to(device, non_blocking=True)
         labels = labels.to(device, non_blocking=True)
 
         outputs = model(images)
@@ -775,6 +822,8 @@ def main():
                         help="禁用混合精度训练")
     parser.add_argument("--no-mixup", action="store_true",
                         help="禁用 MixUp/CutMix 数据增强")
+    parser.add_argument("--no-compile", action="store_true",
+                        help="禁用 torch.compile（默认启用以加速训练）")
 
     args = parser.parse_args()
 
@@ -875,7 +924,12 @@ def main():
                 f.write(f"{img_path}\t{label}\t{full_dataset.classes[label]}\n")
         logger.info(f"测试集路径清单已保存: {test_paths_file}")
 
-    # 数据加载器
+    # 数据加载器（GPU 利用率优化的关键）
+    # persistent_workers=True 避免每个 epoch 重新 spawn worker
+    #   ⭐ 这是消除 GPU 监视图上"谷底"（epoch 间 30-40s 空闲）的核心改动
+    # prefetch_factor=4 提高预取批次数量，掩盖 CPU 端数据加载延迟
+    # pin_memory_device="cuda" 让 pinned memory 直接在 GPU 端可访问，减少一次拷贝
+    use_persistent = args.workers > 0
     train_loader = DataLoader(
         train_dataset,
         batch_size=args.batch,
@@ -883,6 +937,9 @@ def main():
         num_workers=args.workers,
         pin_memory=True if gpu_info["cuda_available"] else False,
         drop_last=True,
+        persistent_workers=use_persistent,
+        prefetch_factor=4 if use_persistent else None,
+        pin_memory_device="cuda" if gpu_info["cuda_available"] else "",
     )
 
     val_loader = DataLoader(
@@ -891,6 +948,9 @@ def main():
         shuffle=False,
         num_workers=args.workers,
         pin_memory=True if gpu_info["cuda_available"] else False,
+        persistent_workers=use_persistent,
+        prefetch_factor=4 if use_persistent else None,
+        pin_memory_device="cuda" if gpu_info["cuda_available"] else "",
     )
 
     num_classes = class_info["num_classes"]
@@ -911,11 +971,43 @@ def main():
     )
     model = model.to(device)
 
+    # === GPU 训练加速配置 ===
+    use_channels_last = (
+        args.backbone.startswith(("convnext", "efficientnet"))
+        and gpu_info["cuda_available"]
+    )
+    if use_channels_last:
+        # channels_last (NHWC) 内存格式对 ConvNeXt/EfficientNet 在 CUDA 上的
+        # Tensor Core 计算更友好，可获得 10-30% 加速
+        model = model.to(memory_format=torch.channels_last)
+        logger.info("✅ 模型已转换为 channels_last (NHWC) 内存格式")
+
+    # torch.compile：算子融合 + 减少 kernel launch overhead
+    # ⚠️  mode="default" 使用 Inductor 后端做算子融合，但不使用 CUDA Graphs
+    #     mode="reduce-overhead" 会捕获 CUDA Graph，但与
+    #     optimizer.zero_grad(set_to_none=True) 不兼容：
+    #     - set_to_none 释放梯度 tensor 后，下一轮 backward 分配新地址
+    #     - CUDA Graph 检测到地址变化 → 每 batch 都失效并重新 capture
+    #     → Phase 2（更多解冻层）会出现 7s/batch 的灾难性退步
+    if (
+        not args.no_compile
+        and gpu_info["cuda_available"]
+        and hasattr(torch, "compile")
+    ):
+        try:
+            model = torch.compile(model, mode="default")
+            logger.info("✅ torch.compile 已启用（mode=default / Inductor 内核融合）"
+                        " — 首次迭代会较慢（编译），后续 epoch 加速")
+        except Exception as e:
+            logger.warning(f"⚠️  torch.compile 启用失败，回退到 eager 模式: {e}")
+
     # ============================================================
     # 4. 训练
     # ============================================================
     criterion = nn.CrossEntropyLoss(label_smoothing=args.label_smoothing)
-    scaler = GradScaler() if use_amp else None
+    # bfloat16 不需要 GradScaler（动态范围与 fp32 相同）；fp16 需要
+    use_bf16 = gpu_info.get("use_bf16", False) and use_amp
+    scaler = GradScaler() if (use_amp and not use_bf16) else None
 
     logger.info(f"\n正则化配置:")
     logger.info(f"  Label Smoothing:     {args.label_smoothing}")
@@ -960,9 +1052,14 @@ def main():
             max_grad_norm=args.grad_clip,
             use_mixup=use_mixup,
             mixup_alpha=args.mixup_alpha,
+            use_channels_last=use_channels_last,
+            use_bf16=use_bf16,
         )
 
-        val_loss, val_acc = validate(model, val_loader, criterion, device)
+        val_loss, val_acc = validate(
+            model, val_loader, criterion, device,
+            use_channels_last=use_channels_last,
+        )
 
         current_lr = optimizer.param_groups[0]["lr"]
         scheduler.step()
@@ -1005,7 +1102,16 @@ def main():
     logger.info("  - 分类头:           训练 🔥")
     logger.info(f"  - 学习率:           差异化 LR")
     logger.info(f"  - EMA:               decay=0.999 ✅")
+    logger.info(f"  - torch.compile:     Phase 2 首个 batch 需重新 trace（约 10-20s）")
     logger.info("=" * 60)
+
+    # 阶段间重置 torch.compile 状态，确保 Phase 2 的编译从干净状态开始
+    # （Phase 2 解冻更多层后计算图不同，旧的编译缓存会失效）
+    if not args.no_compile and gpu_info["cuda_available"]:
+        try:
+            torch.compiler.reset()
+        except Exception:
+            pass  # PyTorch < 2.1 没有这个 API
 
     # 加载阶段一最佳权重
     best_phase1_path = checkpoint_dir / "best_phase1.pth"
@@ -1040,27 +1146,48 @@ def main():
     logger.info(f"可训练参数: {trainable:,} / {total:,} ({trainable/total*100:.1f}%)")
 
     # 差异化学习率
-    optimizer = optim.AdamW([
+    # ⚠️ 将 generator 显式转为 list，避免：
+    #     1. generator 耗尽后空参数组导致 torch.compile 行为异常
+    #     2. 与 AdamW 的 param_groups 内部迭代行为冲突
+    if args.backbone.startswith("convnext"):
+        group_high = [p for n, p in model.named_parameters()
+                       if "features.7" in n and p.requires_grad]
+        group_mid = [p for n, p in model.named_parameters()
+                      if ("features.6" in n or "features.5" in n or "features.4" in n)
+                      and p.requires_grad]
+    elif args.backbone.startswith("efficientnet"):
+        group_high = [p for n, p in model.named_parameters()
+                       if "features.7" in n and p.requires_grad]
+        group_mid = [p for n, p in model.named_parameters()
+                      if ("features.6" in n or "features.5" in n)
+                      and p.requires_grad]
+    else:  # ResNet
+        group_high = [p for n, p in model.named_parameters()
+                       if "layer4" in n and p.requires_grad]
+        group_mid = [p for n, p in model.named_parameters()
+                      if ("layer3" in n or "layer2" in n)
+                      and p.requires_grad]
+
+    param_groups = [
         {
             "params": getattr(model, head_attr).parameters(),
             "lr": args.lr_finetune * 3,
             "weight_decay": args.weight_decay * 0.5,
         },
-        {
-            "params": (p for n, p in model.named_parameters()
-                        if "features.7" in n or "layer4" in n),
+    ]
+    if group_high:
+        param_groups.append({
+            "params": group_high,
             "lr": args.lr_finetune * 0.5,
             "weight_decay": args.weight_decay,
-        },
-        {
-            "params": (p for n, p in model.named_parameters()
-                        if ("features.6" in n or "features.5" in n or
-                            "features.4" in n or "layer3" in n or "layer2" in n)
-                        and p.requires_grad),
+        })
+    if group_mid:
+        param_groups.append({
+            "params": group_mid,
             "lr": args.lr_finetune * 0.2,
             "weight_decay": args.weight_decay,
-        },
-    ])
+        })
+    optimizer = optim.AdamW(param_groups)
 
     scheduler = CosineWarmupScheduler(
         optimizer, warmup_epochs=min(args.warmup_epochs, 3),
@@ -1088,12 +1215,17 @@ def main():
             max_grad_norm=args.grad_clip,
             use_mixup=use_mixup,
             mixup_alpha=args.mixup_alpha,
+            use_channels_last=use_channels_last,
+            use_bf16=use_bf16,
         )
 
         ema.update(model)
 
         ema.apply_shadow(model)
-        val_loss, val_acc = validate(model, val_loader, criterion, device)
+        val_loss, val_acc = validate(
+            model, val_loader, criterion, device,
+            use_channels_last=use_channels_last,
+        )
         ema.restore(model)
 
         current_lrs = [g["lr"] for g in optimizer.param_groups]
