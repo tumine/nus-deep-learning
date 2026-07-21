@@ -1,19 +1,20 @@
 #!/usr/bin/env python3
 """
-麦克风流式传输与哭声识别服务器
-================================
+麦克风流式传输与哭声识别服务器（PANNs 版本）
+==============================================
 
 功能：
   1. 电脑端启动 HTTPS 服务器，手机浏览器打开网页后通过 WebRTC 传输麦克风音频流
-  2. 电脑端接收音频流，重采样后传入 YAMNet 预训练模型识别哭声
+  2. 电脑端接收音频流，重采样后传入 PANNs（Pretrained Audio Neural Networks）
+     预训练模型识别哭声
   3. 实时输出识别结果到控制台，并通过 SSE 推送到手机端网页
 
 依赖库：
-  必需：aiortc, aiohttp, numpy, tensorflow, tensorflow-hub
+  必需：aiortc, aiohttp, numpy, torch, panns-inference
   可选：scipy（更高质量的音频重采样）、cryptography（SSL 证书生成）
 
 使用方式：
-  python voice_transmission_server.py [--port 8080] [--threshold 0.3]
+  python voice_transmission_server_panns.py [--port 8080] [--threshold 0.3]
   手机通过 Tailscale 访问：https://<电脑Tailscale-IP>:8080
   （首次访问需在浏览器中接受自签名证书警告）
 """
@@ -35,7 +36,7 @@ from aiohttp import web
 from aiortc import RTCPeerConnection, RTCSessionDescription
 
 # ============================================================
-# 可选依赖：scipy（高质量重采样）、tensorflow（YAMNet 推理）
+# 可选依赖：scipy（高质量重采样）
 # ============================================================
 try:
     from scipy.signal import resample_poly
@@ -51,21 +52,16 @@ logging.basicConfig(
     format="%(asctime)s [%(levelname)s] %(message)s",
     datefmt="%H:%M:%S",
 )
-logger = logging.getLogger("voice_server")
+logger = logging.getLogger("voice_server_panns")
 
 # ============================================================
-# YAMNet 与音频处理常量
+# PANNs 与音频处理常量
 # ============================================================
-YAMNET_SAMPLE_RATE = 16000       # YAMNet 要求 16kHz 采样率
-YAMNET_WINDOW = 15600            # 每次推理的样本数 (~0.975 秒)
-YAMNET_HOP = 7800                # 滑动窗口步长 (50% 重叠)
-YAMNET_MODEL_URL = "https://tfhub.dev/google/yamnet/1"
-YAMNET_CLASS_MAP_URL = (
-    "https://raw.githubusercontent.com/tensorflow/models/"
-    "master/research/audioset/yamnet/yamnet_class_map.csv"
-)
+PANNS_SAMPLE_RATE = 32000       # PANNs 模型要求 32kHz 采样率
+PANNS_WINDOW = 32000            # 每次推理的样本数 (~1 秒)
+PANNS_HOP = 16000               # 滑动窗口步长 (50% 重叠)
 
-# 哭声检测阈值（YAMNet 输出的 sigmoid 置信度，0~1）
+# 哭声检测阈值（PANNs 输出的 sigmoid 置信度，0~1）
 DEFAULT_CRY_THRESHOLD = 0.3
 
 # 哭声检测冷却时间（秒）：检测到一次哭声后，冷却期间跳过推理
@@ -73,6 +69,13 @@ CRY_COOLDOWN_SECONDS = 5.0
 
 # 用于在类别表中搜索哭声相关类别的关键词（小写匹配）
 CRY_KEYWORDS = ["cry", "sob", "wail", "whimper", "bawl", "howl"]
+
+# 内置的哭声类别索引（当无法从 panns-inference 获取 labels 时的回退值）
+# 基于 AudioSet 527 类完整列表
+_FALLBACK_CRY_CLASSES = {
+    20: "Baby cry, infant cry",
+    499: "Crying, sobbing",
+}
 
 
 # ============================================================
@@ -102,100 +105,229 @@ def resample_audio(audio: np.ndarray, orig_sr: int, target_sr: int) -> np.ndarra
 
 
 # ============================================================
-# YAMNet 哭声检测器
+# PANNs 哭声检测器
 # ============================================================
 
-class CryDetector:
-    """封装 YAMNet 模型加载与哭声检测逻辑。
+class PannsCryDetector:
+    """封装 PANNs 模型加载与哭声检测逻辑。
 
-    YAMNet 是 Google 基于 AudioSet 训练的 521 类音频事件分类模型，
-    可直接用于检测"Baby cry, infant cry"、"Crying, sobbing"等哭声类别。
+    PANNs（Pretrained Audio Neural Networks）基于 AudioSet 训练，
+    可识别 527 类音频事件，包括 "Baby cry, infant cry"、"Crying, sobbing" 等哭声类别。
+
+    本实现使用 panns-inference 库加载 CNN14 预训练模型，对输入音频进行
+    clip-level 分类（整个音频片段给出一个概率分布）。
     """
-
-    # 内置的哭声类别索引（当无法下载类别表时的回退值）
-    _FALLBACK_CRY_CLASSES = {
-        20: "Baby cry, infant cry",
-        499: "Crying, sobbing",
-    }
 
     def __init__(self, threshold: float = DEFAULT_CRY_THRESHOLD):
         self.threshold = threshold
         self.model = None
+        self.device = "cpu"
         self.cry_classes: dict[int, str] = {}  # {class_id: display_name}
         self._lock = threading.Lock()
         self._load_model()
         self._load_cry_classes()
 
-    def _load_model(self):
-        """从 TF Hub 加载 YAMNet 模型（首次运行会自动下载并缓存）。"""
-        logger.info("正在加载 YAMNet 模型（首次运行需联网下载，请稍候）...")
+    def _download_model_if_needed(self) -> str | None:
+        """手动下载 PANNs 模型到本地（绕过 panns-inference 内置的 wget 调用，兼容 Windows）。
+
+        Returns:
+            模型文件路径，下载失败返回 None。
+        """
+        import os
+        import urllib.request
+
+        checkpoint_dir = Path.home() / "panns_data"
+        checkpoint_path = checkpoint_dir / "Cnn14_mAP=0.431.pth"
+
+        if checkpoint_path.exists():
+            logger.info(f"PANNs 模型文件已存在: {checkpoint_path}")
+            return str(checkpoint_path)
+
+        checkpoint_dir.mkdir(parents=True, exist_ok=True)
+
+        # PANNs CNN14 预训练模型下载地址
+        model_url = (
+            "https://zenodo.org/record/3987831/files/"
+            "Cnn14_mAP%3D0.431.pth?download=1"
+        )
+
+        logger.info(f"PANNs 模型文件不存在，正在用 Python 下载（~500MB，请耐心等待）...")
+        logger.info(f"下载地址: {model_url}")
+        logger.info(f"保存路径: {checkpoint_path}")
+
         try:
-            import tensorflow as tf
-            import tensorflow_hub as hub
-            # 设置 TF 日志级别，减少无关输出
-            tf.get_logger().setLevel("ERROR")
-            self.model = hub.load(YAMNET_MODEL_URL)
-            logger.info("YAMNet 模型加载成功。")
+            def _progress(block_num, block_size, total_size):
+                downloaded = block_num * block_size
+                if total_size > 0:
+                    pct = min(100, downloaded * 100 // total_size)
+                    logger.info(f"  下载进度: {pct}% ({downloaded // (1024*1024)}/{total_size // (1024*1024)} MB)")
+
+            urllib.request.urlretrieve(model_url, str(checkpoint_path), reporthook=_progress)
+            logger.info("PANNs 模型下载完成。")
+            return str(checkpoint_path)
+        except Exception as e:
+            logger.error(f"模型下载失败: {e}")
+            # 清理不完整的下载文件
+            if checkpoint_path.exists():
+                try:
+                    os.remove(str(checkpoint_path))
+                except Exception:
+                    pass
+            return None
+
+    def _load_model(self):
+        """从 panns-inference 加载 PANNs 模型（首次运行自动下载）。"""
+        logger.info("正在加载 PANNs 模型（首次运行需联网下载，请稍候）...")
+        try:
+            import torch
+            from panns_inference import AudioTagging
+
+            self.device = "cuda" if torch.cuda.is_available() else "cpu"
+            logger.info(f"PANNs 使用设备: {self.device}")
+
+            # 先尝试手动下载模型（用 Python urllib，兼容 Windows）
+            checkpoint_path = self._download_model_if_needed()
+
+            if checkpoint_path:
+                self.model = AudioTagging(checkpoint_path=checkpoint_path, device=self.device)
+            else:
+                # 回退：让 panns-inference 自行处理（可能失败于 wget）
+                logger.warning("手动下载失败，回退到 panns-inference 内置下载...")
+                self.model = AudioTagging(checkpoint_path=None, device=self.device)
+
+            logger.info("PANNs 模型加载成功。")
         except ImportError:
-            logger.error("缺少 tensorflow 或 tensorflow-hub，请安装：")
-            logger.error("  pip install tensorflow tensorflow-hub")
+            logger.error("缺少 torch 或 panns-inference，请安装：")
+            logger.error("  pip install torch panns-inference")
             sys.exit(1)
         except Exception as e:
-            logger.error(f"YAMNet 模型加载失败: {e}")
+            logger.error(f"PANNs 模型加载失败: {e}")
             sys.exit(1)
 
     def _load_cry_classes(self):
-        """下载 YAMNet 类别映射表，搜索哭声相关类别。
+        """从 panns-inference 的 labels 列表或 CSV 文件中搜索哭声相关类别。
 
-        若下载失败，使用内置的回退索引。
+        加载优先级：
+          1. panns_inference.labels（内置列表）
+          2. 本地 panns_data/class_labels_indices.csv
+          3. 从 Google AudioSet 官方地址自动下载 CSV
+          4. 内置回退索引 _FALLBACK_CRY_CLASSES
         """
         import urllib.request
 
+        # 方法 1: panns-inference 内置 labels 列表
         try:
-            logger.info("正在下载 YAMNet 类别映射表...")
-            with urllib.request.urlopen(YAMNET_CLASS_MAP_URL, timeout=10) as resp:
-                csv_text = resp.read().decode("utf-8")
-            # 解析 CSV: index,mid,display_name
-            for line in csv_text.strip().split("\n")[1:]:  # 跳过表头
-                parts = line.split(",", 2)
-                if len(parts) < 3:
-                    continue
-                idx = int(parts[0])
-                name = parts[2].strip().strip('"').lower()
-                # 检查是否包含哭声关键词
-                if any(kw in name for kw in CRY_KEYWORDS):
-                    self.cry_classes[idx] = parts[2].strip().strip('"')
-            logger.info(f"从类别表中发现 {len(self.cry_classes)} 个哭声相关类别:")
-            for cid, name in self.cry_classes.items():
-                logger.info(f"  [{cid}] {name}")
-        except Exception as e:
-            logger.warning(f"类别表下载失败 ({e})，使用内置回退索引。")
-            self.cry_classes = dict(self._FALLBACK_CRY_CLASSES)
+            from panns_inference import labels as panns_labels
+            self._parse_labels(panns_labels, "panns_inference.labels")
+            if self.cry_classes:
+                return
+        except Exception:
+            pass
+
+        # 方法 2 + 3: 从 CSV 文件加载（本地或下载）
+        for csv_src in self._get_csv_sources():
+            try:
+                if csv_src.startswith("http"):
+                    logger.info(f"正在从 {csv_src} 下载类别映射表...")
+                    with urllib.request.urlopen(csv_src, timeout=15) as resp:
+                        csv_text = resp.read().decode("utf-8")
+                    source = csv_src
+                else:
+                    csv_path = Path(csv_src)
+                    if not csv_path.exists():
+                        continue
+                    logger.info(f"正在从本地 {csv_path} 读取类别映射表...")
+                    csv_text = csv_path.read_text(encoding="utf-8")
+                    source = str(csv_path)
+
+                labels_list = self._parse_csv_to_labels(csv_text)
+                if labels_list:
+                    self._parse_labels(labels_list, source)
+                    if self.cry_classes:
+                        return
+            except Exception as e:
+                logger.debug(f"尝试 {csv_src} 失败: {e}")
+                continue
+
+        # 方法 4: 内置回退索引
+        logger.warning("所有方法均无法加载类别映射表，使用内置回退索引。")
+        self.cry_classes = dict(_FALLBACK_CRY_CLASSES)
+        for cid, name in self.cry_classes.items():
+            logger.info(f"  [{cid}] {name}")
+
+    @staticmethod
+    def _get_csv_sources() -> list[str]:
+        """返回 CSV 文件来源列表（本地路径 + 远程 URL）。"""
+        return [
+            # 本地路径：panns_data 目录
+            "panns_data/class_labels_indices.csv",
+            str(Path.home() / ".cache/panns/class_labels_indices.csv"),
+            # 官方下载地址
+            "https://storage.googleapis.com/us_audioset/youtube_corpus/v1/csv/class_labels_indices.csv",
+            # GitHub 镜像
+            "https://raw.githubusercontent.com/bpiyush/PANNs/master/metadata/class_labels_indices.csv",
+            "https://raw.githubusercontent.com/IBM/audioset-classification/master/audioset_classify/metadata/class_labels_indices.csv",
+        ]
+
+    @staticmethod
+    def _parse_csv_to_labels(csv_text: str) -> list[str] | None:
+        """将 CSV 文本解析为 527 个类别名列表。"""
+        labels = []
+        for line in csv_text.strip().split("\n")[1:]:  # 跳过表头
+            parts = line.split(",", 2)
+            if len(parts) < 3:
+                continue
+            # 去掉引号
+            name = parts[2].strip().strip('"')
+            labels.append(name)
+        return labels if len(labels) >= 500 else None  # 至少要有 500+ 类才有效
+
+    def _parse_labels(self, labels_list: list[str], source: str):
+        """遍历类别名列表，搜索哭声关键词。"""
+        for idx, name in enumerate(labels_list):
+            name_lower = name.lower()
+            if any(kw in name_lower for kw in CRY_KEYWORDS):
+                if idx not in self.cry_classes:
+                    self.cry_classes[idx] = name
+        if self.cry_classes:
+            logger.info(f"从 [{source}] 发现 {len(self.cry_classes)} 个哭声相关类别:")
             for cid, name in self.cry_classes.items():
                 logger.info(f"  [{cid}] {name}")
 
     def predict(self, waveform: np.ndarray) -> dict:
-        """对一段 16kHz 单声道音频进行 YAMNet 推理。
+        """对一段 32kHz 单声道音频进行 PANNs 推理。
 
         Args:
-            waveform: float32 numpy array, shape (N,), 16kHz, 值域 [-1, 1]
+            waveform: float32 numpy array, shape (N,), 32kHz, 值域 [-1, 1]
 
         Returns:
             dict:
               - cry_detected: bool        是否检测到哭声
               - max_cry_score: float      哭声类别最高得分
-              - cry_details: list[dict]   超过阈值的帧详情
+              - cry_details: list[dict]   超过阈值的类别详情
               - top_classes: list[str]    整体 Top-5 类别名
         """
+        import torch
+
         with self._lock:
             # 输入过短时补零
-            if len(waveform) < YAMNET_WINDOW:
-                padded = np.zeros(YAMNET_WINDOW, dtype=np.float32)
+            if len(waveform) < PANNS_WINDOW:
+                padded = np.zeros(PANNS_WINDOW, dtype=np.float32)
                 padded[: len(waveform)] = waveform
                 waveform = padded
 
-            scores, _embeddings, _spectrogram = self.model(waveform)
-            scores_np = scores.numpy()  # (num_frames, 521)
+            # PANNs 输入需要 (batch_size, samples)
+            audio_batch = waveform[None, :]  # (1, N)
+
+            # 推理（clip-level 概率）
+            with torch.no_grad():
+                clipwise_output, _ = self.model.inference(audio_batch)
+                # panns-inference 某些版本直接返回 numpy 数组，兼容处理
+                out = clipwise_output[0]
+                if hasattr(out, 'cpu'):
+                    scores = out.cpu().numpy()  # torch tensor
+                else:
+                    scores = np.asarray(out)     # 已是 numpy 数组
 
         result = {
             "cry_detected": False,
@@ -206,29 +338,26 @@ class CryDetector:
 
         # 检查哭声类别
         for class_id, class_name in self.cry_classes.items():
-            if class_id >= scores_np.shape[1]:
+            if class_id >= scores.shape[0]:
                 continue
-            class_scores = scores_np[:, class_id]
-            max_score = float(np.max(class_scores))
-            if max_score > result["max_cry_score"]:
-                result["max_cry_score"] = max_score
-            if max_score >= self.threshold:
+            class_score = float(scores[class_id])
+            if class_score > result["max_cry_score"]:
+                result["max_cry_score"] = class_score
+            if class_score >= self.threshold:
                 result["cry_detected"] = True
-                trigger_frames = np.where(class_scores >= self.threshold)[0]
-                for frame_idx in trigger_frames:
-                    result["cry_details"].append({
-                        "class": class_name,
-                        "class_id": int(class_id),
-                        "score": float(class_scores[frame_idx]),
-                        "frame": int(frame_idx),
-                    })
+                result["cry_details"].append({
+                    "class": class_name,
+                    "class_id": int(class_id),
+                    "score": class_score,
+                    "frame": 0,  # PANNs 为 clip-level，无帧概念，用 0 占位
+                })
 
-        # 整体 Top-5 类别（按所有帧平均得分）
-        mean_scores = scores_np.mean(axis=0)
-        top5_idx = np.argsort(mean_scores)[-5:][::-1]
+        # 整体 Top-5 类别
+        top5_idx = np.argsort(scores)[-5:][::-1]
         result["top_classes"] = [
-            {"id": int(i), "name": self.cry_classes.get(int(i), f"class_{int(i)}"),
-             "score": round(float(mean_scores[i]), 4)}
+            {"id": int(i),
+             "name": self.cry_classes.get(int(i), f"class_{int(i)}"),
+             "score": round(float(scores[i]), 4)}
             for i in top5_idx
         ]
 
@@ -240,13 +369,13 @@ class CryDetector:
 # ============================================================
 
 class AudioProcessor:
-    """从 WebRTC AudioFrame 接收音频，缓冲后送入 YAMNet 推理。
+    """从 WebRTC AudioFrame 接收音频，缓冲后送入 PANNs 推理。
 
     音频处理流水线：
-      WebRTC Opus(48kHz) → PCM int16 → float32[-1,1] → 重采样到 16kHz → 缓冲 → YAMNet 推理
+      WebRTC Opus(48kHz) → PCM int16 → float32[-1,1] → 重采样到 32kHz → 缓冲 → PANNs 推理
     """
 
-    def __init__(self, detector: CryDetector, on_result=None):
+    def __init__(self, detector: PannsCryDetector, on_result=None):
         self.detector = detector
         self.on_result = on_result  # 回调函数，接收推理结果 dict
         self.buffer = np.array([], dtype=np.float32)
@@ -294,26 +423,26 @@ class AudioProcessor:
         # int16 → float32 归一化到 [-1, 1]
         float_audio = mono.astype(np.float32) / 32768.0
 
-        # 重采样到 16kHz
-        if audio_frame.sample_rate != YAMNET_SAMPLE_RATE:
+        # 重采样到 32kHz
+        if audio_frame.sample_rate != PANNS_SAMPLE_RATE:
             float_audio = resample_audio(
-                float_audio, audio_frame.sample_rate, YAMNET_SAMPLE_RATE
+                float_audio, audio_frame.sample_rate, PANNS_SAMPLE_RATE
             )
 
         # 追加到缓冲区
         self.buffer = np.concatenate([self.buffer, float_audio])
         self.total_samples += len(float_audio)
 
-        return len(self.buffer) >= YAMNET_WINDOW
+        return len(self.buffer) >= PANNS_WINDOW
 
     def process(self):
-        """从缓冲区取一个窗口的数据进行 YAMNet 推理并输出结果。"""
-        if len(self.buffer) < YAMNET_WINDOW:
+        """从缓冲区取一个窗口的数据进行 PANNs 推理并输出结果。"""
+        if len(self.buffer) < PANNS_WINDOW:
             return
 
         # 取窗口数据，滑动步长为 50% 重叠
-        waveform = self.buffer[:YAMNET_WINDOW]
-        self.buffer = self.buffer[YAMNET_HOP:]
+        waveform = self.buffer[:PANNS_WINDOW]
+        self.buffer = self.buffer[PANNS_HOP:]
 
         # 冷却时间检查：检测到哭声后跳过推理 CRY_COOLDOWN_SECONDS 秒
         now = time.time()
@@ -341,7 +470,7 @@ class AudioProcessor:
         try:
             result = self.detector.predict(waveform)
         except Exception as e:
-            logger.error(f"YAMNet 推理出错: {e}")
+            logger.error(f"PANNs 推理出错: {e}")
             return
 
         # 输出结果
@@ -383,7 +512,7 @@ class AudioProcessor:
         for detail in result["cry_details"]:
             print(
                 f"    类别: {detail['class']} (ID={detail['class_id']})  "
-                f"得分: {detail['score']:.4f}  帧: {detail['frame']}"
+                f"得分: {detail['score']:.4f}"
             )
         print(f"  本窗口哭声最高分: {result['max_cry_score']:.4f}")
         print(f"{'=' * 60}\n")
@@ -483,11 +612,26 @@ h1 { font-size: 1.4rem; margin: 20px 0 6px; color: #fff; text-align: center; }
 .log-entry { padding: 2px 0; }
 .log-entry.cry { color: #ff6b6b; font-weight: bold; }
 .log-entry.info { color: #4fc3f7; }
+.cry-stats-area {
+    width: 100%; max-width: 380px; background: #0a0a14; border-radius: 12px;
+    padding: 14px; margin-bottom: 14px; max-height: 200px; overflow-y: auto;
+    font-family: 'SF Mono', 'Fira Code', monospace; font-size: 0.72rem;
+    color: #888; border: 1px solid #2a2a4a;
+}
+.cry-stats-area .cry-stats-title {
+    color: #ff6b6b; font-weight: bold; font-size: 0.78rem;
+    margin-bottom: 8px; border-bottom: 1px solid #2a1a1a; padding-bottom: 6px;
+}
+.cry-stats-area .cry-entry {
+    padding: 2px 0; color: #ff6b6b; font-weight: bold;
+}
+.cry-stats-area .cry-entry .time { color: #aa5555; font-weight: normal; }
+.cry-stats-empty { color: #444; font-style: italic; }
 </style>
 </head>
 <body>
 <h1>🎤 麦克风音频传输</h1>
-<p class="subtitle">将手机麦克风音频流发送到电脑进行哭声识别</p>
+<p class="subtitle">将手机麦克风音频流发送到电脑进行哭声识别（PANNs）</p>
 
 <div class="alert-box" id="alertBox"></div>
 
@@ -502,6 +646,11 @@ h1 { font-size: 1.4rem; margin: 20px 0 6px; color: #fff; text-align: center; }
     <div class="status-row"><span class="label">推理次数</span><span class="value" id="infCount">0</span></div>
     <div class="status-row"><span class="label">哭声事件</span><span class="value" id="cryCount">0</span></div>
     <div class="status-row"><span class="label">哭声评分</span><span class="value" id="cryScore">0.0000</span></div>
+</div>
+
+<div class="cry-stats-area" id="cryStatsArea">
+    <div class="cry-stats-title">🔴 哭声统计</div>
+    <div class="cry-stats-empty" id="cryStatsEmpty">暂无哭声事件</div>
 </div>
 
 <button class="btn btn-start" id="startBtn" onclick="startStream()">开始传输</button>
@@ -527,6 +676,20 @@ function addLog(msg, cls) {
     $('logArea').appendChild(entry);
     $('logArea').scrollTop = $('logArea').scrollHeight;
     while ($('logArea').children.length > 60) $('logArea').removeChild($('logArea').firstChild);
+    // 将哭声（红色日志）归总到哭声统计栏
+    if (cls === 'cry') {
+        const empty = $('cryStatsEmpty');
+        if (empty) empty.style.display = 'none';
+        const cryEntry = document.createElement('div');
+        cryEntry.className = 'cry-entry';
+        const ts = new Date().toLocaleTimeString();
+        cryEntry.innerHTML = '<span class="time">[' + ts + ']</span> ' + msg;
+        $('cryStatsArea').appendChild(cryEntry);
+        $('cryStatsArea').scrollTop = $('cryStatsArea').scrollHeight;
+        // 保留最近 50 条哭声统计
+        const cryEntries = $('cryStatsArea').querySelectorAll('.cry-entry');
+        while (cryEntries.length > 50) cryEntries[0].remove();
+    }
 }
 
 function showAlert(msg) {
@@ -590,7 +753,18 @@ async function startStream() {
 
         // 建立 WebRTC 连接
         $('connState').textContent = '建立 WebRTC...';
-        const localPc = new RTCPeerConnection({ iceServers: [{ urls: 'stun:stun.l.google.com:19302' }] });
+        // 使用多个 STUN 服务器避免单点故障：
+        //   - Google STUN 可能在国内不可达导致 40s 超时
+        //   - 腾讯 STUN 作为国内备选
+        //   - 对于 Tailscale/LAN 连接，host candidates 已足够，STUN 非必需
+        const localPc = new RTCPeerConnection({
+            iceServers: [
+                { urls: 'stun:stun.l.google.com:19302' },
+                { urls: 'stun:stun.qq.com:3478' },
+            ],
+            // 可选：使用 relay 模式强制走 TURN，但默认 all 即可
+            iceTransportPolicy: 'all',
+        });
         pc = localPc;  // 更新全局引用（供 stopStream 关闭用）
 
         localPc.onconnectionstatechange = () => {
@@ -609,16 +783,27 @@ async function startStream() {
         localStream.getTracks().forEach(t => pc.addTrack(t, localStream));
         addLog('音频轨道已添加');
 
-        // 创建 Offer 并等待 ICE 收集完成（非 trickle 模式，简化信令）
+        // 创建 Offer 并等待 ICE 候选收集（带超时，避免 STUN 不可达时阻塞 40 秒）
+        // 原因：stun.l.google.com 在国内可能不可达，STUN 超时约 40 秒。
+        // 而 Tailscale/LAN 环境下 host candidates 已足够建立直连。
         const offer = await localPc.createOffer();
         await localPc.setLocalDescription(offer);
-        await new Promise(resolve => {
-            if (localPc.iceGatheringState === 'complete') return resolve();
-            localPc.addEventListener('icegatheringstatechange', () => {
-                if (localPc.iceGatheringState === 'complete') resolve();
-            });
-        });
-        addLog('ICE 候选收集完成');
+
+        // 等待 ICE 候选收集完成，最多等待 8 秒
+        const ICE_GATHERING_TIMEOUT_MS = 8000;
+        await Promise.race([
+            new Promise(resolve => {
+                if (localPc.iceGatheringState === 'complete') return resolve();
+                localPc.addEventListener('icegatheringstatechange', () => {
+                    if (localPc.iceGatheringState === 'complete') resolve();
+                });
+            }),
+            new Promise(resolve => setTimeout(() => {
+                addLog('ICE 候选收集超时 (' + ICE_GATHERING_TIMEOUT_MS / 1000 + 's)，使用已收集的候选继续');
+                resolve();
+            }, ICE_GATHERING_TIMEOUT_MS))
+        ]);
+        addLog('ICE 候选收集完成 (' + localPc.iceGatheringState + ')');
 
         // 发送 Offer 到服务器，接收 Answer
         const resp = await fetch('/offer', {
@@ -662,6 +847,9 @@ function stopStream() {
     $('stopBtn').disabled = true;
     startTime = null;
     addLog('传输已停止');
+    // 重置哭声统计栏
+    $('cryStatsArea').querySelectorAll('.cry-entry').forEach(e => e.remove());
+    $('cryStatsEmpty').style.display = '';
 }
 </script>
 </body>
@@ -836,7 +1024,7 @@ class VoiceServer:
         self.app.router.add_post("/offer", self._handle_offer)
         self.app.router.add_get("/events", self._handle_sse)
 
-        self.detector = CryDetector(threshold=threshold)
+        self.detector = PannsCryDetector(threshold=threshold)
         self.sse_manager = SSEManager()
         self.pc: RTCPeerConnection | None = None
         self.processor: AudioProcessor | None = None
@@ -1013,7 +1201,7 @@ class VoiceServer:
 
         protocol = "https" if self.ssl_ctx else "http"
         print("\n" + "=" * 60)
-        print("  麦克风流式传输与哭声识别服务器")
+        print("  麦克风流式传输与哭声识别服务器（PANNs）")
         print("=" * 60)
         print(f"\n  本地访问:    {protocol}://127.0.0.1:{self.port}")
         if tailscale_ip:
@@ -1033,6 +1221,7 @@ class VoiceServer:
             print(f"    请安装 openssl 或 pip install cryptography")
 
         print(f"\n  哭声检测阈值: {self.detector.threshold}")
+        print(f"  使用设备: {self.detector.device}")
         print(f"  监控的哭声类别:")
         for cid, name in self.detector.cry_classes.items():
             print(f"    [{cid}] {name}")
@@ -1055,12 +1244,12 @@ class VoiceServer:
 
 def main():
     parser = argparse.ArgumentParser(
-        description="麦克风流式传输与哭声识别服务器",
+        description="麦克风流式传输与哭声识别服务器（PANNs）",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 示例:
-  python voice_transmission_server.py
-  python voice_transmission_server.py --port 9000 --threshold 0.25
+  python voice_transmission_server_panns.py
+  python voice_transmission_server_panns.py --port 9000 --threshold 0.25
         """,
     )
     parser.add_argument("--host", default="0.0.0.0", help="监听地址 (默认: 0.0.0.0)")
@@ -1076,7 +1265,7 @@ def main():
             __import__(mod)
         except ImportError:
             missing.append(mod)
-    for mod in ("tensorflow", "tensorflow_hub"):
+    for mod in ("torch", "panns_inference"):
         try:
             __import__(mod)
         except ImportError:
