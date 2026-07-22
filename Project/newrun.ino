@@ -40,6 +40,12 @@ float accelX, accelY, accelZ;         // 加速度（g）
 float gyroX, gyroY, gyroZ;            // 角速度（deg/s）
 float gyroZBias = 0;                  // Z 轴陀螺仪零偏
 
+// 陀螺仪量程 ±1000 deg/s（灵敏度 32.8 LSB/(deg/s)）
+// 全速原地旋转时角速度可能超过 ±250 deg/s，量程过小会饱和，导致积分角度严重偏小
+const float GYRO_SENS = 32.8;
+unsigned long i2cErrorCount = 0;      // I2C 通讯失败计数（诊断用）
+unsigned int mpuResetCount = 0;       // 检测到 MPU-6500 复位的次数（诊断用）
+
 // ---------- 转向 PID 参数 ----------
 float turnKp = 2.95;                   // 比例系数
 float turnKi = 0.3;                   // 积分系数
@@ -58,9 +64,11 @@ void setup() {
   Serial.println("  T [angle] - Turn angle (degrees), positive left, negative right");
   Serial.println("  (After G/T completes, 'Done' is sent)");
   Serial.println("  RST - Reset encoder counts");
+  Serial.println("  M - Gyro debug (no motors, rotate by hand)");
 
   // 初始化 I2C 和 MPU-6500 陀螺仪
   Wire.begin();
+  Wire.setWireTimeout(3000, true);  // 防止 I2C 卡死（若旧版内核编译报错可删除本行）
   initMPU6500();
 
   motor1.setSpeed(speedValue);
@@ -110,6 +118,9 @@ void loop() {
         return;
       }
       turnAngle(angle);
+    }
+    else if (cmd == 'M') {
+      debugGyro();
     }
     else if (cmd == 'R' && param == "ST") { // "RST"
       noInterrupts();
@@ -269,11 +280,15 @@ void turnAngle(float angle_deg) {
   const int SETTLE_NEEDED = 8;  
 
   while (true) {
-    // 【修复】使用轻量级 readGyroZOnly() 替代 readMPU6500()
-    // readMPU6500() 使用 endTransmission(false)（repeated start）读取 14 字节，
-    // 在本硬件上会导致 MPU-6500 寄存器指针设置失败，返回固定错误数据（恒为 36.53）。
-    // readGyroZOnly() 使用 endTransmission(true)（独立写/读事务）只读 2 字节，更稳定。
     float gz = readGyroZOnly();
+
+    // 【修复】NaN 保护：I2C 连续失败时跳过本次积分，保持上次 yaw 不变
+    if (isnan(gz)) {
+      // 检测 MPU-6500 是否因电机全速导致电源跌落而进入 SLEEP 模式
+      ensureMPU6500Awake();
+      delay(5);
+      continue;
+    }
 
     unsigned long now = micros();
     float dt = (now - lastTime) / 1000000.0;
@@ -294,8 +309,8 @@ void turnAngle(float angle_deg) {
       int motorSpeed = constrain(abs((int)turnOutput), 0, 255);
       
       // 添加死区补偿：如果速度太小电机转不动，给一个启动底速（根据你的车体重量调整）
-      if (motorSpeed > 0 && motorSpeed < 50) {
-          motorSpeed = 180; 
+      if (motorSpeed > 0 && motorSpeed < 130) {
+          motorSpeed = 130; 
       }
 
       // 【修复4】动态方向控制：如果 turnOutput < 0，说明越过了目标，需要临时反转方向
@@ -349,18 +364,19 @@ void turnAngle(float angle_deg) {
   Serial.println("Done");
 }
 
-// ========== MPU-6500 初始化（含陀螺仪零偏校准）==========
-void initMPU6500() {
+// ========== 唤醒并配置 MPU-6500（可重复调用，用于复位后自动恢复）==========
+void wakeMPU6500() {
   // 步骤 1：唤醒 MPU-6500（退出睡眠模式）
   Wire.beginTransmission(MPU6500_ADDR);
   Wire.write(0x6B);  // PWR_MGMT_1 寄存器地址
   Wire.write(0x00);  // 写入 0x00，唤醒传感器
   Wire.endTransmission(true);
 
-  // 步骤 2：配置陀螺仪量程为 ±250 deg/s（灵敏度 131 LSB/(deg/s)）
+  // 步骤 2：配置陀螺仪量程为 ±1000 deg/s（灵敏度 32.8 LSB/(deg/s)）
+  // 全速原地旋转角速度可超过 ±250 deg/s，量程不足会饱和，导致积分角度严重偏小
   Wire.beginTransmission(MPU6500_ADDR);
   Wire.write(0x1B);  // GYRO_CONFIG 寄存器地址
-  Wire.write(0x00);  // 0x00 = ±250 deg/s（默认值）
+  Wire.write(0x10);  // 0x10 = ±1000 deg/s
   Wire.endTransmission(true);
 
   // 步骤 3：配置加速度计量程为 ±2g（灵敏度 16384 LSB/g，默认值）
@@ -369,9 +385,20 @@ void initMPU6500() {
   Wire.write(0x00);  // 0x00 = ±2g（默认值）
   Wire.endTransmission(true);
 
+  // 步骤 4：开启 DLPF（陀螺仪带宽 44Hz），抑制电机振动引入的高频噪声
+  Wire.beginTransmission(MPU6500_ADDR);
+  Wire.write(0x1A);  // CONFIG 寄存器地址
+  Wire.write(0x03);  // DLPF_CFG = 3
+  Wire.endTransmission(true);
+}
+
+// ========== MPU-6500 初始化（含陀螺仪零偏校准）==========
+void initMPU6500() {
+  wakeMPU6500();
+
   delay(100);  // 等待传感器稳定
 
-  // 步骤 4：陀螺仪零偏校准
+  // 陀螺仪零偏校准
   // 小车静止状态下采样 200 次，取平均值作为零偏
   long sumGyroZ = 0;
   for (int i = 0; i < 200; i++) {
@@ -388,27 +415,94 @@ void initMPU6500() {
 // ========== 轻量级陀螺仪 Z 轴读取（专用于转向 PID 循环）==========
 // 只读取 GYRO_ZOUT_H (0x47) 和 GYRO_ZOUT_L (0x48)，共 2 字节
 // 相比 readMPU6500()（14 字节），I2C 耗时减少约 85%
-// 使用分离写/读事务，不依赖 repeated start，更稳定
+//
+// 【方案 A】使用 Repeated START 模式（endTransmission(false)）替代分离写/读事务：
+//   - STOP 条件可能导致 MPU-6500 内部寄存器指针复位，导致读到错误寄存器
+//   - Repeated START 在读期间保持总线占用，确保寄存器指针不会因 STOP 而复位
+//   - 配合 3 次重试，失败时返回 NaN，由调用方跳过本次积分（避免 0 值污染）
+//   - readMPU6500() 中 14 字节 Repeated START 失败，但 2 字节的 readGyroZOnly() 更稳定
 float readGyroZOnly() {
-  // 步骤 1：写入寄存器地址，发送 STOP
+  for (uint8_t attempt = 0; attempt < 3; attempt++) {
+    // 步骤 1：写入寄存器地址，使用 false（Repeated START），保持总线占用
+    Wire.beginTransmission(MPU6500_ADDR);
+    Wire.write(0x47);                     // GYRO_ZOUT_H
+    if (Wire.endTransmission(false) != 0) {  // false = 不发送 STOP，保持 Repeated START
+      i2cErrorCount++;
+      continue;                         // I2C 通讯错误，重试
+    }
+
+    // 延时让 MPU-6500 准备数据（datasheet 要求 ≥1.25μs，3μs 留余量）
+    delayMicroseconds(3);
+
+    // 步骤 2：在同一事务中读取 2 字节，最后发送 STOP
+    Wire.requestFrom(MPU6500_ADDR, 2, true);
+    if (Wire.available() < 2) {
+      i2cErrorCount++;
+      continue;                         // 数据不足（可能传感器离线），重试
+    }
+
+    uint8_t gzH = Wire.read();
+    uint8_t gzL = Wire.read();
+
+    // 合成 16 位有符号整数并转为 deg/s，减去零偏消除漂移
+    int16_t raw = (int16_t)((gzH << 8) | gzL);
+    return (float)raw / GYRO_SENS - gyroZBias;
+  }
+  return NAN;                           // 连续失败：返回 NaN
+}
+
+// ========== MPU-6500 看门狗：检测复位/SLEEP 并自动恢复 ==========
+// 电机全速时若电源跌落，MPU-6500 会复位并回到 SLEEP 模式（PWR_MGMT_1 = 0x40），
+// 此后陀螺仪输出寄存器恒为 0，读到的"角速度"恒等于 -零偏（表现为固定值，例如 6.09）
+void ensureMPU6500Awake() {
   Wire.beginTransmission(MPU6500_ADDR);
-  Wire.write(0x47);                     // GYRO_ZOUT_H
+  Wire.write(0x6B);  // PWR_MGMT_1
   if (Wire.endTransmission(true) != 0) {
-    return 0;                           // I2C 通讯错误，返回 0
+    i2cErrorCount++;
+    return;
   }
-
-  // 步骤 2：独立读取 2 字节
-  Wire.requestFrom(MPU6500_ADDR, 2, true);
-  if (Wire.available() < 2) {
-    return 0;                           // 数据不足（可能传感器离线）
+  Wire.requestFrom(MPU6500_ADDR, 1, true);
+  if (Wire.available() < 1) {
+    i2cErrorCount++;
+    return;
   }
+  uint8_t pwr = Wire.read();
+  if (pwr & 0x40) {        // SLEEP 位被置位 → 传感器曾经复位
+    mpuResetCount++;
+    wakeMPU6500();         // 重新唤醒并恢复配置（零偏沿用，无需重新校准）
+  }
+}
 
-  uint8_t gzH = Wire.read();
-  uint8_t gzL = Wire.read();
-
-  // 合成 16 位有符号整数并转为 deg/s，减去零偏消除漂移
-  int16_t raw = (int16_t)((gzH << 8) | gzL);
-  return (float)raw / 131.0 - gyroZBias;
+// ========== 陀螺仪诊断：不开电机，连续打印 10 秒 ==========
+// 用法：发送 M，然后用手将小车原地转动约 90°，
+// 若 YawInt 能积到约 ±90，说明传感器与积分链路正常，
+// 问题出在电机运行时的电源跌落/电磁干扰
+void debugGyro() {
+  Serial.println("Gyro debug 10s (motors OFF), rotate by hand...");
+  float yaw = 0;
+  unsigned long lastTime = micros();
+  unsigned long start = millis();
+  unsigned long lastPrint = start;
+  while (millis() - start < 10000) {
+    float gz = readGyroZOnly();
+    unsigned long now = micros();
+    float dt = (now - lastTime) / 1000000.0;
+    lastTime = now;
+    if (dt > 0.05) dt = 0.01;
+    if (!isnan(gz)) yaw += gz * dt;    // 有符号积分，正反方向可互相抵消
+    if (millis() - lastPrint >= 100) {
+      Serial.print("GyroZ:");
+      Serial.print(isnan(gz) ? 999.0 : gz);   // 999 表示本次读取失败
+      Serial.print(" YawInt:");
+      Serial.print(yaw);
+      Serial.print(" Err:");
+      Serial.println(i2cErrorCount);
+      lastPrint = millis();
+    }
+    ensureMPU6500Awake();
+    delay(5);
+  }
+  Serial.println("Debug done");
 }
 
 // ========== 读取 MPU-6500 原始数据 ==========
@@ -423,10 +517,10 @@ void readMPU6500Raw() {
   uint8_t gyH = Wire.read(), gyL = Wire.read();
   uint8_t gzH = Wire.read(), gzL = Wire.read();
 
-  // 将 2 字节有符号整数转为物理单位 deg/s
-  gyroX = (float)((int16_t)((gxH << 8) | gxL)) / 131.0;
-  gyroY = (float)((int16_t)((gyH << 8) | gyL)) / 131.0;
-  gyroZ = (float)((int16_t)((gzH << 8) | gzL)) / 131.0;
+  // 将 2 字节有符号整数转为物理单位 deg/s（灵敏度需与 GYRO_CONFIG 量程一致）
+  gyroX = (float)((int16_t)((gxH << 8) | gxL)) / GYRO_SENS;
+  gyroY = (float)((int16_t)((gyH << 8) | gyL)) / GYRO_SENS;
+  gyroZ = (float)((int16_t)((gzH << 8) | gzL)) / GYRO_SENS;
 }
 
 // ========== 读取 MPU-6500 数据（含零偏修正）==========
@@ -451,10 +545,11 @@ void readMPU6500() {
   uint8_t gzH = Wire.read(), gzL = Wire.read();
 
   // 合成 16 位有符号整数，并转换为物理单位
-  // 陀螺仪：±250 deg/s 量程 → 131.0 LSB/(deg/s)，减去零偏消除漂移
-  gyroX = (float)((int16_t)((gxH << 8) | gxL)) / 131.0;
-  gyroY = (float)((int16_t)((gyH << 8) | gyL)) / 131.0;
-  gyroZ = (float)((int16_t)((gzH << 8) | gzL)) / 131.0 - gyroZBias;
+  // 陀螺仪：灵敏度由 GYRO_SENS 定义，需与 GYRO_CONFIG 量程一致
+  // 减去零偏消除漂移
+  gyroX = (float)((int16_t)((gxH << 8) | gxL)) / GYRO_SENS;
+  gyroY = (float)((int16_t)((gyH << 8) | gyL)) / GYRO_SENS;
+  gyroZ = (float)((int16_t)((gzH << 8) | gzL)) / GYRO_SENS - gyroZBias;
 
   // 加速度计：±2g 量程 → 16384.0 LSB/g（暂时保留以备后续扩展）
   accelX = (float)((int16_t)((axH << 8) | axL)) / 16384.0;
