@@ -300,12 +300,30 @@ void turnAngle(float angle_deg) {
 
 // ========== 直行直到障碍物 ==========
 void driveUntilObstacle() {
+  // 1. 开始探测前，先清零编码器
+  noInterrupts();
+  encoderCountLeft = 0;
+  encoderCountRight = 0;
+  interrupts();
+
   while (true) {
     float cm = measureDistance();
     if (cm > 0 && cm < OBSTACLE_DIST) {
       stopAllMotors();
-      Serial.println("D");   // 通知 Python 已停车
+
+      // 2. 停车后，计算走过的距离
+      noInterrupts();
+      long left = abs(encoderCountLeft);
+      long right = abs(encoderCountRight);
+      interrupts();
+      long avgPulses = (left + right) / 2;
+      float traveled_cm = avgPulses * CM_PER_PULSE;
+      
+      // 3. 将距离传回给 Python (格式如: D:45.5)
+      Serial.print("D:");
+      Serial.println(traveled_cm);
       break;
+      
     }
     forward();
     delay(50);
