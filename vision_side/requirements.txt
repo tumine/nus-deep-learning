@@ -1,0 +1,5 @@
+# Classroom Assistant Robot
+# Required Python Packages
+
+opencv-contrib-python>=4.8.0
+numpy>=1.24
