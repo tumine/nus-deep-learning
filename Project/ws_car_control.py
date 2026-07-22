@@ -192,11 +192,38 @@ class CarController:
         print("✅ [抵达现场] 小车已重新回到分叉点路口！")
         print("==================================================\n")
 
-    def wait_for_signal(self, valid_signals):
+    def wait_for_signal(self, valid_signals, timeout=None):
         print(f"\n[等待指令] 正在监听控制信号 {valid_signals} (输入 S 可随时紧急停车) ...")
+        
+        if timeout is not None:
+            print(f"    [超时设置] {timeout} 秒内未收到有效信号将自动继续。")
+            start_time = time.time()
+
+        #if not hasattr(self, "_btn_state"):
+        #    self._btn_state = "ready1"
+
         while True:
             if stop_event.is_set(): 
                 raise RuntimeError("在等待业务信号时检测到紧急停车指令 S")
+            
+            ###
+            #if not self.hw.simulation_mode and self.hw.ser and self.hw.ser.in_waiting > 0:
+            #    try:
+            #        line = self.hw.ser.readline().decode('utf-8').strip()
+            #        if line == "BTN":
+            #            print(f"\n🔘 [硬件按键] 收到 Arduino 触发！当前映射为: '{self._btn_state}'")
+            #            # 自动将映射好的信号塞入队列
+            #            signal_queue.put(self._btn_state)
+            #            
+            #            # 状态反转：为下一次按压做准备
+            #            if self._btn_state == "ready1":
+            #                self._btn_state = "ready2"
+            #            else:
+            #                self._btn_state = "ready1"
+            #    except Exception as e:
+            #        pass
+            ###
+            
             try:
                 sig = signal_queue.get(timeout=0.1)
                 if sig in valid_signals:
@@ -205,14 +232,19 @@ class CarController:
                 else:
                     print(f"[输入错误] 收到的指令 '{sig}' 不在允许列表 {valid_signals} 中，请重新输入！")
             except queue.Empty:
-                continue
+                if timeout is not None and (time.time() - start_time) >= timeout:
+                    print(f"[超时] 在 {timeout} 秒内未收到有效信号，自动继续。")
+                    return None
+                else:
+                    continue
 
     def obstacle_detection_routine(self, turn_direction):
         """遭遇 O 信号后的标准化往返流（由于坐标不反转，此段逻辑极其稳定）"""
         print(" -> [流程触发] 启动超声波探路...")
         detect_distance = self.hw.start_obstacle_detection()
+        print("arrived_student")
         
-        self.wait_for_signal(["ok"])
+        self.wait_for_signal(["go_teacher"])
         
         # 1. 退出侧边栏，倒车回到分叉点中心
         print(" -> [退回分叉点] 正在倒车脱离侧边栏...")
@@ -220,8 +252,9 @@ class CarController:
         
         # 2. 倒回真正的起点
         self.reverse_path_to_start_fork(turn_direction)
+        print("arrived_teacher")
         
-        self.wait_for_signal(["ready1"])
+        self.wait_for_signal(["return_student"])
         
         # 3. 重新开回分叉点
         self.replay_path_to_fork(turn_direction)
@@ -229,8 +262,9 @@ class CarController:
         # 4. 再次深入侧边栏去靠近障碍物
         print(" -> [前行至现场] 重新驶入侧边栏靠近障碍物点...")
         self.execute_move('F', detect_distance)
+        print("arrived_student")
         
-        self.wait_for_signal(["ready2"])
+        self.wait_for_signal(["return_patrol"])
         
         # 5. 最终姿态补偿：退回分叉点中心，并将车头转回直行状态
         print(" -> [姿态补偿] 倒退回该路段最初的旋转拐角处...")
@@ -239,6 +273,7 @@ class CarController:
         print(" -> [姿态补偿] 执行车头方向回正...")
         if turn_direction == 'L':   self.execute_move('R', self.TURN_90_ANGLE)
         elif turn_direction == 'R': self.execute_move('L', self.TURN_90_ANGLE)
+        print("route_rejoined")
 
     def perform_double_side_detection(self):
         """在当前分叉点执行标准的左右双侧探测"""
@@ -246,25 +281,25 @@ class CarController:
         print(f" -> 执行左转探测")
         self.execute_move('L', self.TURN_90_ANGLE)
         
-        sig = self.wait_for_signal(["O", "Q"])
+        sig = self.wait_for_signal(["approach_student"], timeout=5)
         if sig == "O":
             self.obstacle_detection_routine(turn_direction='L')
             print(" -> [左侧] 完结。准备进入右侧同步探测...")
             self.execute_move('R', self.TURN_90_ANGLE)
-            sig_r = self.wait_for_signal(["O", "Q"])
+            sig_r = self.wait_for_signal(["O"], timeout=5)
             if sig_r == "O":   self.obstacle_detection_routine(turn_direction='R')
-            elif sig_r == "Q": self.execute_move('L', self.TURN_90_ANGLE)
+            else: self.execute_move('L', self.TURN_90_ANGLE)
                 
-        elif sig == "Q":
-            print(" -> [左侧] 收到 'Q'，向右回正。")
+        else:
+            print(" -> [左侧] 无障碍物，向右回正。")
             self.execute_move('R', self.TURN_90_ANGLE)
             
             print(" -> 准备进入右侧同步探测...")
             self.execute_move('R', self.TURN_90_ANGLE)
-            sig_r = self.wait_for_signal(["O", "Q"])
+            sig_r = self.wait_for_signal(["O"], timeout=5)
             if sig_r == "O":   self.obstacle_detection_routine(turn_direction='R')
-            elif sig_r == "Q":
-                print(" -> [右侧] 收到 'Q'，向左回正。")
+            else:
+                print(" -> [右侧] 无障碍物，向左回正。")
                 self.execute_move('L', self.TURN_90_ANGLE)
 
 
