@@ -282,12 +282,12 @@ class CarController:
         self.execute_move('L', self.TURN_90_ANGLE)
         
         sig = self.wait_for_signal(["approach_student"], timeout=5)
-        if sig == "O":
+        if sig == "approach_student":
             self.obstacle_detection_routine(turn_direction='L')
             print(" -> [左侧] 完结。准备进入右侧同步探测...")
             self.execute_move('R', self.TURN_90_ANGLE)
-            sig_r = self.wait_for_signal(["O"], timeout=5)
-            if sig_r == "O":   self.obstacle_detection_routine(turn_direction='R')
+            sig_r = self.wait_for_signal(["approach_student"], timeout=5)
+            if sig_r == "approach_student":   self.obstacle_detection_routine(turn_direction='R')
             else: self.execute_move('L', self.TURN_90_ANGLE)
                 
         else:
@@ -296,8 +296,8 @@ class CarController:
             
             print(" -> 准备进入右侧同步探测...")
             self.execute_move('R', self.TURN_90_ANGLE)
-            sig_r = self.wait_for_signal(["O"], timeout=5)
-            if sig_r == "O":   self.obstacle_detection_routine(turn_direction='R')
+            sig_r = self.wait_for_signal(["approach_student"], timeout=5)
+            if sig_r == "approach_student":   self.obstacle_detection_routine(turn_direction='R')
             else:
                 print(" -> [右侧] 无障碍物，向左回正。")
                 self.execute_move('L', self.TURN_90_ANGLE)
