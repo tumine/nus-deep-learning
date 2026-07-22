@@ -31,7 +31,7 @@ from flask import Flask, Response, render_template_string, jsonify
 
 # 摄像头帧（线程共享）
 _frame_lock = threading.Lock()
-_latest_frame = None  # JPEG 编码后的字节串
+_latest_frame = None  # raw RGB numpy array
 
 # 拍照计数
 _capture_count = 0
@@ -285,7 +285,7 @@ def index():
 
 @app.route("/video_feed")
 def video_feed():
-    """MJPEG 视频流"""
+    """MJPEG 视频流 — 内部帧为 RGB，实时转换为 BGR 后编码为 JPEG"""
 
     def generate():
         while True:
@@ -298,9 +298,13 @@ def video_feed():
                        b"Content-Type: image/jpeg\r\n\r\n" +
                        placeholder + b"\r\n")
             else:
+                # 参考 videostream.py：RGB → BGR → JPEG 编码
+                frame_bgr = cv2.cvtColor(frame, cv2.COLOR_RGB2BGR)
+                _, jpeg = cv2.imencode(".jpg", frame_bgr,
+                                       [cv2.IMWRITE_JPEG_QUALITY, 85])
                 yield (b"--frame\r\n"
                        b"Content-Type: image/jpeg\r\n\r\n" +
-                       frame + b"\r\n")
+                       jpeg.tobytes() + b"\r\n")
             time.sleep(0.04)  # ~25 fps
 
     return Response(generate(),
@@ -323,8 +327,12 @@ def capture():
     save_path = _save_dir / filename
 
     try:
+        # 参考 videostream.py：RGB → BGR → JPEG 编码后保存
+        frame_bgr = cv2.cvtColor(frame, cv2.COLOR_RGB2BGR)
+        _, jpeg = cv2.imencode(".jpg", frame_bgr,
+                               [cv2.IMWRITE_JPEG_QUALITY, 85])
         with open(save_path, "wb") as f:
-            f.write(frame)
+            f.write(jpeg.tobytes())
     except OSError as e:
         return jsonify({"status": "error", "msg": f"写入失败: {e}"}), 500
 
@@ -417,23 +425,23 @@ def _camera_thread(camera_index: int, width: int, height: int):
         actual_h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
         print(f"[摄像头] OpenCV VideoCapture 已就绪, 索引 {camera_index}, 分辨率: {actual_w}x{actual_h}")
 
-    # ── 主循环：读取帧并编码为 JPEG ──────────────────────────────────
-    encode_params = [cv2.IMWRITE_JPEG_QUALITY, 85]
-
+    # ── 主循环：读取帧，统一存储为 RGB 格式 ──────────────────────────
     while True:
         try:
             if picam2 is not None:
-                # picamera2: 直接拿到 numpy RGB 数组，需转为 BGR 再编码
+                # picamera2 配置为 RGB888，capture_array() 直接返回 RGB
                 frame = picam2.capture_array()
                 if frame is None or frame.size == 0:
                     time.sleep(0.01)
                     continue
-                frame = cv2.cvtColor(frame, cv2.COLOR_RGB2BGR)
+                # frame 已经是 RGB，无需转换
             elif cap is not None:
                 ret, frame = cap.read()
                 if not ret or frame is None:
                     time.sleep(0.1)
                     continue
+                # OpenCV VideoCapture 返回 BGR，转为 RGB
+                frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
             else:
                 return  # 两边都不可用，退出线程
         except Exception as ex:
@@ -441,11 +449,8 @@ def _camera_thread(camera_index: int, width: int, height: int):
             time.sleep(0.1)
             continue
 
-        # 编码为 JPEG
-        _, jpeg = cv2.imencode(".jpg", frame, encode_params)
-
         with _frame_lock:
-            _latest_frame = jpeg.tobytes()
+            _latest_frame = frame
 
     # 清理
     if cap is not None:

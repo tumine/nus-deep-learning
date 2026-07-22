@@ -87,21 +87,19 @@ DIST_COEFFS = np.array([
 # 程序会在 ArUco 检测前先用 cv2.fisheye.undistortImage() 校正图像，
 # 然后用内参矩阵 CAMERA_MATRIX（校正后的等效矩阵）进行位姿估计。
 
-USE_FISHEYE = False  # ★ 如果使用鱼眼镜头，改为 True
+USE_FISHEYE = True  # ★ 如果使用鱼眼镜头，改为 True
 
 # 鱼眼内参矩阵（原始未校正，通过 visual_binding.py 标定得到）
-FISHEYE_K = np.array([
-    [300.0,   0.0, 320.0],
-    [  0.0, 300.0, 240.0],
-    [  0.0,   0.0,   1.0]
-], dtype=np.float64)
+FISHEYE_K = np.array([[6.85266789e+02, 3.51737854e-01, 6.62568813e+02]
+ [0.00, 6.88540257e+02, 3.20814717e+02]
+ [0.00, 0.00, 1.00000000e+00]], dtype=np.float64)
 
 # 鱼眼畸变系数 [k1, k2, k3, k4]（4 个参数）
 FISHEYE_D = np.array([
-    [0.0],   # ← 替换：k1
-    [0.0],   # ← 替换：k2
-    [0.0],   # ← 替换：k3
-    [0.0]    # ← 替换：k4
+    [0.16150065],   # k1
+    [-0.0232708],   # k2
+    [-0.02598167],  # k3
+    [0.02933367]    # k4
 ], dtype=np.float64)
 
 # 鱼眼校正后的等效针孔内参矩阵（如果 USE_FISHEYE=True，在 main() 中自动计算）
