@@ -41,10 +41,10 @@ float gyroX, gyroY, gyroZ;            // 角速度（deg/s）
 float gyroZBias = 0;                  // Z 轴陀螺仪零偏
 
 // ---------- 转向 PID 参数 ----------
-float turnKp = 2.5;                   // 比例系数
+float turnKp = 2.95;                   // 比例系数
 float turnKi = 0.3;                   // 积分系数
 float turnKd = 0.8;                   // 微分系数
-const int TURN_BASE_SPEED = 120;      // 转向基础速度，PID 在此基础上加减
+const int TURN_BASE_SPEED = 180;      // 转向基础速度，PID 在此基础上加减
 
 // ---------- 串口命令存储 ----------
 String command = "";
@@ -269,7 +269,11 @@ void turnAngle(float angle_deg) {
   const int SETTLE_NEEDED = 8;  
 
   while (true) {
-    readMPU6500();
+    // 【修复】使用轻量级 readGyroZOnly() 替代 readMPU6500()
+    // readMPU6500() 使用 endTransmission(false)（repeated start）读取 14 字节，
+    // 在本硬件上会导致 MPU-6500 寄存器指针设置失败，返回固定错误数据（恒为 36.53）。
+    // readGyroZOnly() 使用 endTransmission(true)（独立写/读事务）只读 2 字节，更稳定。
+    float gz = readGyroZOnly();
 
     unsigned long now = micros();
     float dt = (now - lastTime) / 1000000.0;
@@ -278,9 +282,9 @@ void turnAngle(float angle_deg) {
 
     // 【修复2】方向感知积分：如果正在往预期方向转，角度增加；如果正在反转修正，角度减少
     if (turnOutput >= 0) {
-      yaw += abs(gyroZ) * dt;
+      yaw += abs(gz) * dt;
     } else {
-      yaw -= abs(gyroZ) * dt;
+      yaw -= abs(gz) * dt;
     }
 
     turnInput = yaw;
@@ -320,12 +324,12 @@ void turnAngle(float angle_deg) {
       Serial.print("Yaw:"); Serial.print(yaw);
       Serial.print(" Target:"); Serial.print(targetAngle);
       Serial.print(" Out:"); Serial.print(turnOutput);
-      Serial.print(" Gyro:"); Serial.println(abs(gyroZ));
+      Serial.print(" Gyro:"); Serial.println(abs(gz));
       lastPrintTime = millis();
     }
 
     float angleError = abs(targetAngle - yaw);
-    if (angleError < 1.0 && abs(gyroZ) < 3.0) {
+    if (angleError < 1.0 && abs(gz) < 3.0) {
       settleCount++;
       if (settleCount >= SETTLE_NEEDED) break;
     } else {
@@ -381,12 +385,38 @@ void initMPU6500() {
   Serial.println(gyroZBias);
 }
 
+// ========== 轻量级陀螺仪 Z 轴读取（专用于转向 PID 循环）==========
+// 只读取 GYRO_ZOUT_H (0x47) 和 GYRO_ZOUT_L (0x48)，共 2 字节
+// 相比 readMPU6500()（14 字节），I2C 耗时减少约 85%
+// 使用分离写/读事务，不依赖 repeated start，更稳定
+float readGyroZOnly() {
+  // 步骤 1：写入寄存器地址，发送 STOP
+  Wire.beginTransmission(MPU6500_ADDR);
+  Wire.write(0x47);                     // GYRO_ZOUT_H
+  if (Wire.endTransmission(true) != 0) {
+    return 0;                           // I2C 通讯错误，返回 0
+  }
+
+  // 步骤 2：独立读取 2 字节
+  Wire.requestFrom(MPU6500_ADDR, 2, true);
+  if (Wire.available() < 2) {
+    return 0;                           // 数据不足（可能传感器离线）
+  }
+
+  uint8_t gzH = Wire.read();
+  uint8_t gzL = Wire.read();
+
+  // 合成 16 位有符号整数并转为 deg/s，减去零偏消除漂移
+  int16_t raw = (int16_t)((gzH << 8) | gzL);
+  return (float)raw / 131.0 - gyroZBias;
+}
+
 // ========== 读取 MPU-6500 原始数据 ==========
 // 仅读取原始寄存器值，不做零偏修正（用于校准阶段）
 void readMPU6500Raw() {
   Wire.beginTransmission(MPU6500_ADDR);
   Wire.write(0x43);  // 从 GYRO_XOUT_H 开始读取（跳过加速度和温度）
-  Wire.endTransmission(false);
+  Wire.endTransmission(true);   // 【修复】使用 STOP 替代 repeated start，避免寄存器指针设置失败
   Wire.requestFrom(MPU6500_ADDR, 6, true);  // 只读陀螺仪 6 字节
 
   uint8_t gxH = Wire.read(), gxL = Wire.read();
@@ -404,7 +434,7 @@ void readMPU6500Raw() {
 void readMPU6500() {
   Wire.beginTransmission(MPU6500_ADDR);
   Wire.write(0x3B);  // 从 ACCEL_XOUT_H 开始，连续读取 14 字节
-  Wire.endTransmission(false);
+  Wire.endTransmission(true);   // 【修复】使用 STOP 替代 repeated start，避免寄存器指针设置失败
   Wire.requestFrom(MPU6500_ADDR, 14, true);
 
   // --- 加速度计（6 字节，3 轴 × 2 字节）---

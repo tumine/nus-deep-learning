@@ -1,6 +1,6 @@
 import time
 import serial
-import serial.tools.list_ports  
+import serial.tools.list_ports  # pip install pyserial
 import sys
 import threading
 import queue
