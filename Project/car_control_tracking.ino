@@ -511,6 +511,7 @@ void trackForward() {
     // 【交叉口判定】中部左右两个传感器同时压黑：
     // 说明横向黑线已经到达车身中部，车体中心位于路口中央 → 停车
     if (ml && mr) {
+      delay(120);  // 关键数据：补偿运动的时间
       trackFinish("Done");
       return;
     }
