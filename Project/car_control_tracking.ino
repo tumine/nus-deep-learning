@@ -45,9 +45,10 @@ const int TRACK_PIN_RR = 45;   // 5号 - 右后  (Rear Right)
 
 // ---------- 循迹运动参数 ----------
 const int TRACK_SPEED       = 160;    // 循迹直行基础速度（0~255）
-const int TRACK_SLOW_SPEED  = 90;     // 循迹修正时内侧减速后的速度
+const int TRACK_SLOW_SPEED  = 60;     // 循迹修正时内侧减速后的速度
 const int TRACK_TURN_SPEED  = 150;    // 原地旋转/弯道转向速度
 const unsigned long TRACK_TIMEOUT = 30000; // 循迹动作超时（ms）
+const unsigned long TRACK_TURN_MINTIME = 150; // 转向时间阈值，超过该阈值后才可触发停下
 
 // ---------- 串口命令存储 ----------
 String command = "";
@@ -563,18 +564,22 @@ void trackBackward() {
     if (rl && rr) {
       // 两后端同时压黑：多为碰到路口横线，继续后退交给中部确认
       setSideSpeed(TRACK_SPEED, TRACK_SPEED);
+      delay(50);
       driveBackwardSilent();
     } else if (rl) {
       // 仅左后压黑：黑线偏向车尾左侧 → 左侧减速，让车尾向左靠回黑线
-      setSideSpeed(TRACK_SLOW_SPEED, TRACK_SPEED);
+      setSideSpeed(TRACK_SLOW_SPEED, TRACK_SPEED + 40);
+      delay(50);
       driveBackwardSilent();
     } else if (rr) {
       // 仅右后压黑：黑线偏向车尾右侧 → 右侧减速修正
-      setSideSpeed(TRACK_SPEED, TRACK_SLOW_SPEED);
+      setSideSpeed(TRACK_SPEED + 40, TRACK_SLOW_SPEED);
+      delay(50);
       driveBackwardSilent();
     } else {
       // 两后端都在白色区域：车尾居中 → 全速后退
       setSideSpeed(TRACK_SPEED, TRACK_SPEED);
+      delay(50);
       driveBackwardSilent();
     }
     delay(5);
@@ -644,7 +649,7 @@ void pivotTurn(bool leftTurn) {
   else          rotateRightSilent();
 
   // ---- 阶段1：等待基准前端传感器离开黑线，进入白区（LOW）----
-  while (onLine(frontPin)) {
+  while (onLine(frontPin) || millis() - start < TRACK_TURN_MINTIME) {
     if (checkEmergencyStop()) { restoreSpeed(); return; }
     if (millis() - start > TRACK_TIMEOUT) { trackFinish("Timeout"); return; }
     delay(2);
@@ -652,7 +657,7 @@ void pivotTurn(bool leftTurn) {
 
   // ---- 阶段2：继续旋转，直到基准前端传感器再次压到黑线（HIGH），
   //             即检测到新方向的黑线 → 停车 ----
-  while (!onLine(frontPin)) {
+  while (!onLine(frontPin) || millis() - start < TRACK_TURN_MINTIME) {
     if (checkEmergencyStop()) { restoreSpeed(); return; }
     if (millis() - start > TRACK_TIMEOUT) { trackFinish("Timeout"); return; }
     delay(2);
