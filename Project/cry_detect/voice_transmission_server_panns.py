@@ -67,6 +67,9 @@ DEFAULT_CRY_THRESHOLD = 0.3
 # 哭声检测冷却时间（秒）：检测到一次哭声后，冷却期间跳过推理
 CRY_COOLDOWN_SECONDS = 5.0
 
+# 教师端 WebSocket 地址
+DEFAULT_TEACHER_URL = "ws://127.0.0.1:8000/ws"
+
 # 用于在类别表中搜索哭声相关类别的关键词（小写匹配）
 CRY_KEYWORDS = ["cry", "sob", "wail", "whimper", "bawl", "howl"]
 
@@ -554,6 +557,81 @@ class SSEManager:
 
 
 # ============================================================
+# 教师端通知器（WebSocket）
+# ============================================================
+
+class TeacherNotifier:
+    """通过 WebSocket 向教师端发送哭声检测事件消息。
+
+    教师端 (teacher_client.py) 在 /ws 端点监听 WebSocket 连接，
+    接收 JSON 格式的消息并展示在前端页面。
+    """
+
+    def __init__(self, teacher_url: str):
+        self.teacher_url = teacher_url
+        self.ws = None
+        self._message_counter = 0
+
+    async def _connect_if_needed(self):
+        """如果未连接则尝试建立 WebSocket 连接。"""
+        if self.ws is not None:
+            return
+        try:
+            import websockets
+            self.ws = await websockets.connect(
+                self.teacher_url,
+                ping_interval=20,
+                ping_timeout=10,
+                close_timeout=5,
+            )
+            logger.info(f"已连接到教师端: {self.teacher_url}")
+        except ImportError:
+            logger.warning(
+                "缺少 websockets 库，无法连接教师端。"
+                "安装: pip install websockets"
+            )
+        except Exception as e:
+            logger.warning(f"无法连接到教师端 ({self.teacher_url}): {e}")
+
+    async def send_cry_alert(self):
+        """发送哭声检测告警到教师端。
+
+        消息格式：
+          - message_id: 唯一消息编号
+          - axis_x / axis_y: 无效值（哭声检测无位置信息）
+          - request: "教师协助"
+          - description: 哭声检测详情
+        """
+        await self._connect_if_needed()
+        if self.ws is None:
+            return
+
+        self._message_counter += 1
+        msg = {
+            "message_id": (
+                f"cry-{int(time.time() * 1000)}-"
+                f"{self._message_counter:04d}"
+            ),
+            "axis_x": -1,
+            "axis_y": -1,
+            "request": "教师协助",
+            "description": "检测到婴儿哭声，请前往查看",
+        }
+        try:
+            import websockets
+            await self.ws.send(json.dumps(msg, ensure_ascii=False))
+            logger.info(f"已向教师端发送哭声告警: {msg['message_id']}")
+        except websockets.exceptions.ConnectionClosed:
+            logger.warning(
+                "教师端 WebSocket 连接已关闭，将在下次检测时重连"
+            )
+            self.ws = None
+        except Exception as e:
+            logger.warning(f"向教师端发送消息失败: {e}")
+            self.ws = None
+
+
+# ============================================================
 # 手机端网页 (HTML + JS)
 # ============================================================
 
@@ -1015,7 +1093,9 @@ def configure_firewall(port: int):
 class VoiceServer:
     """主服务器：HTTP 路由 + WebRTC 信令 + 音频处理。"""
 
-    def __init__(self, host: str, port: int, threshold: float, ssl_ctx: ssl.SSLContext | None):
+    def __init__(self, host: str, port: int, threshold: float,
+                 ssl_ctx: ssl.SSLContext | None,
+                 teacher_url: str | None = None):
         self.host = host
         self.port = port
         self.ssl_ctx = ssl_ctx
@@ -1026,6 +1106,9 @@ class VoiceServer:
 
         self.detector = PannsCryDetector(threshold=threshold)
         self.sse_manager = SSEManager()
+        self.teacher_notifier = (
+            TeacherNotifier(teacher_url) if teacher_url else None
+        )
         self.pc: RTCPeerConnection | None = None
         self.processor: AudioProcessor | None = None
         self.audio_task: asyncio.Task | None = None
@@ -1138,7 +1221,7 @@ class VoiceServer:
             logger.info("音频处理循环已结束")
 
     def _on_inference_result(self, result: dict):
-        """推理结果回调：通过 SSE 广播到手机端。
+        """推理结果回调：通过 SSE 广播到手机端，并通知教师端（哭声事件）。
 
         此方法在 to_thread 的工作线程中调用，需通过 run_coroutine_threadsafe
         将广播任务调度到主事件循环。
@@ -1162,9 +1245,25 @@ class VoiceServer:
                 f"max_cry_score={sse_data['max_cry_score']:.4f}"
             )
         if self._loop and self._loop.is_running():
-            asyncio.run_coroutine_threadsafe(self.sse_manager.broadcast(sse_data), self._loop)
+            asyncio.run_coroutine_threadsafe(
+                self.sse_manager.broadcast(sse_data), self._loop
+            )
         else:
-            logger.warning(f"无法推送 SSE: _loop 未就绪或已停止 (_loop={self._loop is not None})")
+            logger.warning(
+                f"无法推送 SSE: _loop 未就绪或已停止 "
+                f"(_loop={self._loop is not None})"
+            )
+
+        # 如果检测到哭声，通知教师端
+        if result.get("cry_detected") and self.teacher_notifier:
+            if self._loop and self._loop.is_running():
+                asyncio.run_coroutine_threadsafe(
+                    self.teacher_notifier.send_cry_alert(), self._loop
+                )
+            else:
+                logger.warning(
+                    "无法通知教师端: 事件循环未就绪"
+                )
 
     # ----------------------------------------------------------
     # 连接管理
@@ -1256,6 +1355,8 @@ def main():
     parser.add_argument("--port", type=int, default=8080, help="监听端口 (默认: 8080)")
     parser.add_argument("--threshold", type=float, default=DEFAULT_CRY_THRESHOLD,
                         help=f"哭声检测阈值 0~1 (默认: {DEFAULT_CRY_THRESHOLD})")
+    parser.add_argument("--teacher-url", type=str, default=DEFAULT_TEACHER_URL,
+                        help=f"教师端 WebSocket 地址 (默认: {DEFAULT_TEACHER_URL})")
     args = parser.parse_args()
 
     # 依赖检查
@@ -1286,6 +1387,7 @@ def main():
     server = VoiceServer(
         host=args.host, port=args.port,
         threshold=args.threshold, ssl_ctx=ssl_ctx,
+        teacher_url=args.teacher_url,
     )
 
     try:
