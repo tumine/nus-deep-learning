@@ -628,39 +628,31 @@ void cornerTurn(bool leftTurn) {
 // ==========================================================
 // PL / PR：交叉路口原地旋转 90 度
 // 场景：车体中心已停在标准十字路口中央（通常由 TF/TB 停下）
-// 仅以中部（2,3号）传感器为基准：
-//   阶段1：原地旋转，直到中部两个传感器都离开脚下的黑线（全白）
-//   阶段2：继续旋转，直到内侧中部传感器压到新方向的黑线
-//   阶段3：继续旋转，直到内侧中部传感器越过黑线回到白区，
-//           黑线位于两中部传感器之间 → 已对准新方向，停车
+// 以内侧前端传感器为基准（PL 看左前 0号，PR 看右前 1号）：
+//   阶段1：原地旋转，直到该前端传感器离开黑线进入白区（LOW）
+//   阶段2：继续旋转，直到该前端传感器再次压到黑线（HIGH），
+//           说明车头已扫到新方向的黑线 → 立即停车
 // ==========================================================
 void pivotTurn(bool leftTurn) {
   unsigned long start = millis();
   setSideSpeed(TRACK_TURN_SPEED, TRACK_TURN_SPEED);
 
-  // 内侧中部传感器：左转看左中（2号），右转看右中（3号）
-  int innerMidPin = leftTurn ? TRACK_PIN_ML : TRACK_PIN_MR;
+  // 基准前端传感器：左旋看左前（0号），右旋看右前（1号）
+  int frontPin = leftTurn ? TRACK_PIN_FL : TRACK_PIN_FR;
 
   if (leftTurn) rotateLeftSilent();
   else          rotateRightSilent();
 
-  // ---- 阶段1：等待中部离开当前黑线（两中部均为白 LOW）----
-  while (onLine(TRACK_PIN_ML) || onLine(TRACK_PIN_MR)) {
+  // ---- 阶段1：等待基准前端传感器离开黑线，进入白区（LOW）----
+  while (onLine(frontPin)) {
     if (checkEmergencyStop()) { restoreSpeed(); return; }
     if (millis() - start > TRACK_TIMEOUT) { trackFinish("Timeout"); return; }
     delay(2);
   }
 
-  // ---- 阶段2：继续旋转，直到内侧中部压到新方向黑线（HIGH）----
-  while (!onLine(innerMidPin)) {
-    if (checkEmergencyStop()) { restoreSpeed(); return; }
-    if (millis() - start > TRACK_TIMEOUT) { trackFinish("Timeout"); return; }
-    delay(2);
-  }
-
-  // ---- 阶段3：继续旋转少许，让内侧传感器越过黑线回到白区，
-  //             黑线落在两中部传感器之间 → 对准新方向 ----
-  while (onLine(innerMidPin)) {
+  // ---- 阶段2：继续旋转，直到基准前端传感器再次压到黑线（HIGH），
+  //             即检测到新方向的黑线 → 停车 ----
+  while (!onLine(frontPin)) {
     if (checkEmergencyStop()) { restoreSpeed(); return; }
     if (millis() - start > TRACK_TIMEOUT) { trackFinish("Timeout"); return; }
     delay(2);
