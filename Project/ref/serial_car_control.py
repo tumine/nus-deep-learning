@@ -14,6 +14,12 @@ serial_car_control.py
     T <angle> - 旋转指定角度（度），正=左转，负=右转，完成后返回 "Done"
     RST       - 重置编码器计数
 
+循迹命令（HW-511 模块，完成后均返回 "Done"）:
+    TF        - 循迹前进，直到到达交叉路口中央
+    TB        - 循迹倒车，直到退至交叉路口中央
+    CL / CR   - 直角弯道沿黑线左转 / 右转 90 度
+    PL / PR   - 交叉路口原地左旋 / 右旋 90 度
+
 用法:
     python serial_car_control.py          # 交互模式
     或:
@@ -67,6 +73,7 @@ class CarSerial:
     DEFAULT_TIMEOUT      = 1.0
     MOVE_TIMEOUT         = 35.0          # G / T 命令最长等待时间（s）
     OBSTACLE_TIMEOUT     = 60.0          # O 命令最长等待时间（s）
+    TRACK_TIMEOUT        = 35.0          # 循迹命令最长等待时间（s，Arduino 端 30s 超时 + 余量）
 
     def __init__(self, baudrate=None, port=None, simulation_mode=False):
         """
@@ -221,6 +228,44 @@ class CarSerial:
         return None
 
     # ------------------------------------------------------------------
+    # 循迹命令（HW-511，等待 Done）
+    # ------------------------------------------------------------------
+    def _track_command(self, cmd: str, desc: str) -> bool:
+        """发送循迹命令并阻塞等待 Done / Timeout，返回是否成功"""
+        self._write(cmd)
+        if self.simulation_mode:
+            time.sleep(0.5)
+            print(f"  [模拟] {desc} 完成")
+            return True
+        reply = self._wait_for(lambda l: l in (self.REPLY_DONE, self.REPLY_TIMEOUT),
+                               self.TRACK_TIMEOUT, desc=desc)
+        return reply == self.REPLY_DONE
+
+    def track_forward(self) -> bool:
+        """循迹前进至交叉路口中央（TF 命令），返回 True 表示成功"""
+        return self._track_command("TF", "循迹前进")
+
+    def track_backward(self) -> bool:
+        """循迹倒车至交叉路口中央（TB 命令），返回 True 表示成功"""
+        return self._track_command("TB", "循迹倒车")
+
+    def corner_left(self) -> bool:
+        """直角弯道沿黑线左转 90 度（CL 命令）"""
+        return self._track_command("CL", "弯道左转")
+
+    def corner_right(self) -> bool:
+        """直角弯道沿黑线右转 90 度（CR 命令）"""
+        return self._track_command("CR", "弯道右转")
+
+    def pivot_left(self) -> bool:
+        """交叉路口原地左旋 90 度（PL 命令）"""
+        return self._track_command("PL", "路口左旋")
+
+    def pivot_right(self) -> bool:
+        """交叉路口原地右旋 90 度（PR 命令）"""
+        return self._track_command("PR", "路口右旋")
+
+    # ------------------------------------------------------------------
     # 编码器重置
     # ------------------------------------------------------------------
     def reset_encoders(self):
@@ -258,6 +303,11 @@ def interactive():
     print("    T <角度deg>    - 旋转指定角度（负数为右转）")
     print("    O              - 前进直到检测到障碍物")
     print("    RST            - 重置编码器")
+    print("    --- 循迹命令 (HW-511) ---")
+    print("    TF             - 循迹前进至交叉路口")
+    print("    TB             - 循迹倒车至交叉路口")
+    print("    CL / CR        - 直角弯道左转 / 右转")
+    print("    PL / PR        - 路口原地左旋 / 右旋 90度")
     print("    quit / q       - 退出")
     print("=" * 50)
 
@@ -275,6 +325,18 @@ def interactive():
             upper = raw.upper()
             if upper in ('QUIT', 'Q', 'EXIT'):
                 break
+            # --- 循迹命令（必须先于单字符 T 解析，避免 TF/TB 被当作 T 角度命令）---
+            elif upper in ('TF', 'TB', 'CL', 'CR', 'PL', 'PR'):
+                actions = {
+                    'TF': car.track_forward,
+                    'TB': car.track_backward,
+                    'CL': car.corner_left,
+                    'CR': car.corner_right,
+                    'PL': car.pivot_left,
+                    'PR': car.pivot_right,
+                }
+                ok = actions[upper]()
+                print(f"  → {'成功' if ok else '失败/超时'}")
             elif upper == 'F':
                 car.go_forward()
             elif upper == 'B':
