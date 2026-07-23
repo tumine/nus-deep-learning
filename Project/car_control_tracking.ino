@@ -32,12 +32,12 @@ float angleScale = 2.0;   // 硬编码，不可动态修改
 
 // ---------- HW-511 循迹模块引脚（引脚尚未确定，先用 A0-A5 占位，接线后请修改） ----------
 // 模块编号 - 物理位置 - 引脚变量
-const int TRACK_PIN_FL = A0;   // 0号 - 左前  (Front Left)
-const int TRACK_PIN_FR = A1;   // 1号 - 右前  (Front Right)
-const int TRACK_PIN_ML = A2;   // 2号 - 左中  (Middle Left)
-const int TRACK_PIN_MR = A3;   // 3号 - 右中  (Middle Right)
-const int TRACK_PIN_RL = A4;   // 4号 - 左后  (Rear Left)
-const int TRACK_PIN_RR = A5;   // 5号 - 右后  (Rear Right)
+const int TRACK_PIN_FL = 39;   // 0号 - 左前  (Front Left)
+const int TRACK_PIN_FR = 41;   // 1号 - 右前  (Front Right)
+const int TRACK_PIN_ML = 37;   // 2号 - 左中  (Middle Left)
+const int TRACK_PIN_MR = 43;   // 3号 - 右中  (Middle Right)
+const int TRACK_PIN_RL = 35;   // 4号 - 左后  (Rear Left)
+const int TRACK_PIN_RR = 45;   // 5号 - 右后  (Rear Right)
 
 // HW-511 输出电平约定：压在黑线上（不反光）输出 HIGH，白色地面（反光）输出 LOW。
 // 若实际模块极性相反，只需把下面的宏改为 LOW。
