@@ -82,7 +82,8 @@ void setup() {
   Serial.println("  TB - Track backward until intersection");
   Serial.println("  CL/CR - Follow 90-deg corner, turn left/right");
   Serial.println("  PL/PR - Pivot 90-deg left/right at intersection");
-  Serial.println("  PU - Pivot 180-deg (U-turn) on the line");
+  Serial.println("  PU - Pivot 180-deg (U-turn) on the intersection");
+  Serial.println("  PN - Pivot 180-deg (U-turn) on the line");
   Serial.println("  TO - Track forward until obstacle, then send 'D:<dist>'");
   Serial.println("  (After tracking completes, 'Done' is sent)");
   Serial.print("Current angle scale (fixed): ");
@@ -152,6 +153,7 @@ void loop() {
     else if (command == "PL") { pivotLeft();        return; }
     else if (command == "PR") { pivotRight();       return; }
     else if (command == "PU") { pivotUTurn();       return; }
+    else if (command == "PN") { pivotLeft();        return; }
 
     char cmd = command.charAt(0);
     String param = command.substring(1);

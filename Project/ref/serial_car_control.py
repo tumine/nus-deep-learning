@@ -267,9 +267,13 @@ class CarSerial:
         """交叉路口原地右旋 90 度（PR 命令）"""
         return self._track_command("PR", "路口右旋")
 
-    def pivot_u_turn(self) -> bool:
+    def pivot_u_turn_intersection(self) -> bool:
         """交叉路口原地旋转 180 度掉头（PU 命令）"""
         return self._track_command("PU", "路口掉头180度")
+
+    def pivot_u_turn_line(self) -> bool:
+        """直线原地左旋 180 度掉头（PN 命令）"""
+        return self._track_command("PN", "直线掉头180度")
 
     def track_until_obstacle(self) -> float | None:
         """
@@ -338,6 +342,7 @@ def interactive():
     print("    CL / CR        - 直角弯道左转 / 右转")
     print("    PL / PR        - 路口原地左旋 / 右旋 90度")
     print("    PU             - 路口原地旋转 180度 掉头")
+    print("    PN             - 直线原地旋转 180度 掉头")
     print("    quit / q       - 退出")
     print("=" * 50)
 
@@ -356,7 +361,7 @@ def interactive():
             if upper in ('QUIT', 'Q', 'EXIT'):
                 break
             # --- 循迹命令（必须先于单字符 T 解析，避免 TF/TB/TO 被当作 T 角度命令）---
-            elif upper in ('TF', 'TB', 'CL', 'CR', 'PL', 'PR', 'PU'):
+            elif upper in ('TF', 'TB', 'CL', 'CR', 'PL', 'PR', 'PU', 'PN'):
                 actions = {
                     'TF': car.track_forward,
                     'TB': car.track_backward,
@@ -364,7 +369,8 @@ def interactive():
                     'CR': car.corner_right,
                     'PL': car.pivot_left,
                     'PR': car.pivot_right,
-                    'PU': car.pivot_u_turn,
+                    'PU': car.pivot_u_turn_intersection,
+                    'PN': car.pivot_u_turn_line,
                 }
                 ok = actions[upper]()
                 print(f"  → {'成功' if ok else '失败/超时'}")
