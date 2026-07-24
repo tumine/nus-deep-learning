@@ -19,6 +19,7 @@ import queue
 import sys
 
 from camera import Camera
+from audio_dispatcher import play_audio_blocking
 from card_detector_classifier import CardDetector
 from speech_request_detector import SpeechRequestDetector
 from hand_detector import HandDetector
@@ -151,6 +152,17 @@ def handle_request_event(request_event, request_manager, task_queue, state_machi
     Both sources are normalized to the structure required by RequestManager.
     A valid event always advances WAIT_CARD -> GO_TEACHER.
     """
+    audio_id = 3 if request_event.get("request") == "teacher" else 2
+    print(f"[AUDIO] Playing request confirmation {audio_id} before teacher dispatch.")
+    try:
+        played = play_audio_blocking(audio_id)
+    except (FileNotFoundError, ValueError) as audio_error:
+        print(f"[AUDIO WARNING] {audio_error}")
+        played = False
+
+    if not played:
+        print("[AUDIO WARNING] Confirmation did not complete; continuing after audio failure/timeout.")
+
     task = request_manager.create_task(request_event)
     task["student_context"] = state_machine.get_context()
     task["request_source"] = request_event.get("source", "vision")

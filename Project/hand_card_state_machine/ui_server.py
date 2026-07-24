@@ -8,13 +8,15 @@ The server runs in a daemon thread started by main.py.
 from __future__ import annotations
 
 import asyncio
+import base64
 import json
 import threading
+import uuid
 import webbrowser
 
 import uvicorn
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect
-from fastapi.responses import HTMLResponse
+from fastapi import FastAPI, HTTPException, Request, WebSocket, WebSocketDisconnect
+from fastapi.responses import HTMLResponse, JSONResponse
 
 from ui_manager import UIManager
 
@@ -80,6 +82,9 @@ button:disabled{background:#cbd5e1;color:#64748b;cursor:not-allowed;opacity:.72}
       <div class="card">
         <h2>🎛 Control</h2>
         <div class="actions">
+          <button id="audioButton" class="load" onclick="enableAudio()">
+            Enable Phone Audio
+          </button>
           <button class="stop" onclick="sendCommand('STOP')">
             🛑 EMERGENCY STOP
           </button>
@@ -115,6 +120,8 @@ button:disabled{background:#cbd5e1;color:#64748b;cursor:not-allowed;opacity:.72}
 <script>
 let socket = null;
 let requests = [];
+let audioUnlocked = false;
+let activeAudio = null;
 
 function log(text){
   const box=document.getElementById("eventLog");
@@ -181,6 +188,63 @@ function handleMessage(message){
     document.getElementById("currentRequest").textContent=data.description||"-";
     renderRequests();
     log(`New request: ${data.description||"-"}`);
+  }else if(type==="play_audio"){
+    playRemoteAudio(data);
+  }
+}
+function sendPlaybackResult(type,requestId,error){
+  if(socket&&socket.readyState===WebSocket.OPEN){
+    socket.send(JSON.stringify({type,request_id:requestId,error:error||""}));
+  }
+}
+async function enableAudio(){
+  try{
+    const silentAudio=new Audio();
+    silentAudio.muted=true;
+    await silentAudio.play().catch(()=>{});
+    audioUnlocked=true;
+    const button=document.getElementById("audioButton");
+    button.textContent="Phone Audio Ready";
+    button.disabled=true;
+    log("Phone audio enabled.");
+  }catch(error){
+    log("Audio permission was not granted.");
+  }
+}
+function playRemoteAudio(data){
+  if(!audioUnlocked){
+    sendPlaybackResult("audio_playback_error",data.request_id,"Phone audio is not enabled.");
+    log("Audio rejected: enable phone audio first.");
+    return;
+  }
+  try{
+    if(activeAudio){
+      activeAudio.pause();
+      activeAudio=null;
+    }
+    const bytes=Uint8Array.from(atob(data.audio_base64),character=>character.charCodeAt(0));
+    const url=URL.createObjectURL(new Blob([bytes],{type:data.media_type||"audio/mp4"}));
+    const audio=new Audio(url);
+    activeAudio=audio;
+    audio.onended=()=>{
+      URL.revokeObjectURL(url);
+      activeAudio=null;
+      sendPlaybackResult("audio_playback_complete",data.request_id);
+      log(`Audio ${data.audio_id} finished.`);
+    };
+    audio.onerror=()=>{
+      URL.revokeObjectURL(url);
+      activeAudio=null;
+      sendPlaybackResult("audio_playback_error",data.request_id,"Browser could not play the audio.");
+    };
+    audio.play().catch(error=>{
+      URL.revokeObjectURL(url);
+      activeAudio=null;
+      sendPlaybackResult("audio_playback_error",data.request_id,error.message);
+    });
+    log(`Playing audio ${data.audio_id}.`);
+  }catch(error){
+    sendPlaybackResult("audio_playback_error",data.request_id,error.message);
   }
 }
 function connect(){
@@ -241,12 +305,54 @@ class UIServer:
         self.open_browser = open_browser
         self.app = FastAPI()
         self.active_connections: list[WebSocket] = []
+        self._pending_audio: dict[str, asyncio.Future[bool]] = {}
         self._register_routes()
 
     def _register_routes(self) -> None:
         @self.app.get("/")
         async def root() -> HTMLResponse:
             return HTMLResponse(HTML_PAGE)
+
+        @self.app.post("/api/audio")
+        async def play_audio(request: Request) -> JSONResponse:
+          try:
+            payload = await request.json()
+            audio_base64 = str(payload["audio_base64"])
+            base64.b64decode(audio_base64, validate=True)
+          except (KeyError, TypeError, ValueError, json.JSONDecodeError) as error:
+            raise HTTPException(400, "Invalid audio payload.") from error
+
+          if not self.active_connections:
+            raise HTTPException(503, "No phone browser is connected.")
+
+          request_id = uuid.uuid4().hex
+          completion = asyncio.get_running_loop().create_future()
+          self._pending_audio[request_id] = completion
+          event = {
+            "type": "play_audio",
+            "data": {
+              "request_id": request_id,
+              "audio_id": payload.get("audio_id"),
+                    "filename": payload.get("filename", "audio.m4a"),
+                    "media_type": payload.get("media_type", "audio/mp4"),
+              "audio_base64": audio_base64,
+            },
+          }
+
+          try:
+            delivered = await self._broadcast(event)
+            if not delivered:
+              raise HTTPException(503, "No phone browser is connected.")
+            played = await asyncio.wait_for(completion, timeout=15.0)
+          except TimeoutError as error:
+            raise HTTPException(504, "Timed out waiting for phone playback.") from error
+          finally:
+            self._pending_audio.pop(request_id, None)
+
+          if not played:
+            raise HTTPException(409, "Phone browser could not play the audio.")
+
+          return JSONResponse({"played": True, "request_id": request_id})
 
         @self.app.websocket("/ws")
         async def websocket_endpoint(websocket: WebSocket) -> None:
@@ -272,6 +378,16 @@ class UIServer:
                         command = str(message.get("command", "")).upper()
                         if command:
                             self.ui_manager.submit_command(command)
+                    elif message.get("type") in {
+                      "audio_playback_complete",
+                      "audio_playback_error",
+                    }:
+                      request_id = str(message.get("request_id", ""))
+                      completion = self._pending_audio.get(request_id)
+                      if completion is not None and not completion.done():
+                        completion.set_result(
+                          message.get("type") == "audio_playback_complete"
+                        )
 
             except WebSocketDisconnect:
                 pass
@@ -292,16 +408,22 @@ class UIServer:
             if event is None:
                 continue
 
-            dead_connections: list[WebSocket] = []
-            for connection in list(self.active_connections):
-                try:
-                    await connection.send_json(event)
-                except Exception:
-                    dead_connections.append(connection)
+            await self._broadcast(event)
 
-            for connection in dead_connections:
-                if connection in self.active_connections:
-                    self.active_connections.remove(connection)
+    async def _broadcast(self, event: dict) -> bool:
+        delivered = False
+        dead_connections: list[WebSocket] = []
+        for connection in list(self.active_connections):
+            try:
+                await connection.send_json(event)
+                delivered = True
+            except Exception:
+                dead_connections.append(connection)
+
+        for connection in dead_connections:
+            if connection in self.active_connections:
+                self.active_connections.remove(connection)
+        return delivered
 
     def run(self) -> None:
         if self.open_browser:
