@@ -48,7 +48,8 @@ const int TRACK_SPEED       = 160;    // 循迹直行基础速度（0~255）
 const int TRACK_SLOW_SPEED  = 60;     // 循迹修正时内侧减速后的速度
 const int TRACK_TURN_SPEED  = 150;    // 原地旋转/弯道转向速度
 const unsigned long TRACK_TIMEOUT = 30000; // 循迹动作超时（ms）
-const unsigned long TRACK_TURN_MINTIME = 150; // 转向时间阈值，超过该阈值后才可触发停下
+const unsigned long TRACK_TURN_MINTIME1 = 150; // 转向时间阈值（进入白区），超过该阈值后才可触发停下
+const unsigned long TRACK_TURN_MINTIME2 = 250; // 转向时间阈值（再次检测到黑区），超过该阈值后才可触发停下
 
 // ---------- 串口命令存储 ----------
 String command = "";
@@ -145,8 +146,8 @@ void loop() {
     else if (command == "TB") { trackBackward();    return; }
     else if (command == "CL") { cornerTurn(true);   return; }
     else if (command == "CR") { cornerTurn(false);  return; }
-    else if (command == "PL") { pivotTurn(true);    return; }
-    else if (command == "PR") { pivotTurn(false);   return; }
+    else if (command == "PL") { pivotLeft();        return; }
+    else if (command == "PR") { pivotRight();       return; }
 
     char cmd = command.charAt(0);
     String param = command.substring(1);
@@ -511,7 +512,7 @@ void trackForward() {
     // 【交叉口判定】中部左右两个传感器同时压黑：
     // 说明横向黑线已经到达车身中部，车体中心位于路口中央 → 停车
     if (ml && mr) {
-      delay(120);  // 关键数据：补偿运动的时间
+      delay(80);  // 【关键数据】补偿运动的时间
       trackFinish("Done");
       return;
     }
@@ -632,33 +633,61 @@ void cornerTurn(bool leftTurn) {
 }
 
 // ==========================================================
-// PL / PR：交叉路口原地旋转 90 度
+// PL：交叉路口原地左旋 90 度
 // 场景：车体中心已停在标准十字路口中央（通常由 TF/TB 停下）
-// 以内侧前端传感器为基准（PL 看左前 0号，PR 看右前 1号）：
-//   阶段1：原地旋转，直到该前端传感器离开黑线进入白区（LOW）
-//   阶段2：继续旋转，直到该前端传感器再次压到黑线（HIGH），
+// 以左前传感器（0号）为基准：
+//   阶段1：原地左旋，直到左前传感器离开黑线进入白区（LOW）
+//   阶段2：继续左旋，直到左前传感器再次压到黑线（HIGH），
 //           说明车头已扫到新方向的黑线 → 立即停车
 // ==========================================================
-void pivotTurn(bool leftTurn) {
+void pivotLeft() {
   unsigned long start = millis();
   setSideSpeed(TRACK_TURN_SPEED, TRACK_TURN_SPEED);
 
-  // 基准前端传感器：左旋看左前（0号），右旋看右前（1号）
-  int frontPin = leftTurn ? TRACK_PIN_FL : TRACK_PIN_FR;
+  rotateLeftSilent();
 
-  if (leftTurn) rotateLeftSilent();
-  else          rotateRightSilent();
-
-  // ---- 阶段1：等待基准前端传感器离开黑线，进入白区（LOW）----
-  while (onLine(frontPin) || millis() - start < TRACK_TURN_MINTIME) {
+  // ---- 阶段1：等待左前传感器离开黑线，进入白区（LOW）----
+  while (onLine(TRACK_PIN_FL) || millis() - start < TRACK_TURN_MINTIME1) {
     if (checkEmergencyStop()) { restoreSpeed(); return; }
     if (millis() - start > TRACK_TIMEOUT) { trackFinish("Timeout"); return; }
     delay(2);
   }
 
-  // ---- 阶段2：继续旋转，直到基准前端传感器再次压到黑线（HIGH），
+  // ---- 阶段2：继续左旋，直到左前传感器再次压到黑线（HIGH），
   //             即检测到新方向的黑线 → 停车 ----
-  while (!onLine(frontPin) || millis() - start < TRACK_TURN_MINTIME) {
+  while (!onLine(TRACK_PIN_FL) || millis() - start < TRACK_TURN_MINTIME2) {
+    if (checkEmergencyStop()) { restoreSpeed(); return; }
+    if (millis() - start > TRACK_TIMEOUT) { trackFinish("Timeout"); return; }
+    delay(2);
+  }
+
+  trackFinish("Done");
+}
+
+// ==========================================================
+// PR：交叉路口原地右旋 90 度
+// 场景：车体中心已停在标准十字路口中央（通常由 TF/TB 停下）
+// 以右前传感器（1号）为基准：
+//   阶段1：原地右旋，直到右前传感器离开黑线进入白区（LOW）
+//   阶段2：继续右旋，直到右前传感器再次压到黑线（HIGH），
+//           说明车头已扫到新方向的黑线 → 立即停车
+// ==========================================================
+void pivotRight() {
+  unsigned long start = millis();
+  setSideSpeed(TRACK_TURN_SPEED, TRACK_TURN_SPEED);
+
+  rotateRightSilent();
+
+  // ---- 阶段1：等待右前传感器离开黑线，进入白区（LOW）----
+  while (onLine(TRACK_PIN_FR) || millis() - start < TRACK_TURN_MINTIME1) {
+    if (checkEmergencyStop()) { restoreSpeed(); return; }
+    if (millis() - start > TRACK_TIMEOUT) { trackFinish("Timeout"); return; }
+    delay(2);
+  }
+
+  // ---- 阶段2：继续右旋，直到右前传感器再次压到黑线（HIGH），
+  //             即检测到新方向的黑线 → 停车 ----
+  while (!onLine(TRACK_PIN_FR) || millis() - start < TRACK_TURN_MINTIME2) {
     if (checkEmergencyStop()) { restoreSpeed(); return; }
     if (millis() - start > TRACK_TIMEOUT) { trackFinish("Timeout"); return; }
     delay(2);
