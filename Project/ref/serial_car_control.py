@@ -17,8 +17,10 @@ serial_car_control.py
 循迹命令（HW-511 模块，完成后均返回 "Done"）:
     TF        - 循迹前进，直到到达交叉路口中央
     TB        - 循迹倒车，直到退至交叉路口中央
+    TO        - 循迹前进直到检测到障碍物，返回行驶距离（cm，格式 D:<dist>）
     CL / CR   - 直角弯道沿黑线左转 / 右转 90 度
     PL / PR   - 交叉路口原地左旋 / 右旋 90 度
+    PU        - 交叉路口原地旋转 180 度（掉头）
 
 用法:
     python serial_car_control.py          # 交互模式
@@ -265,6 +267,32 @@ class CarSerial:
         """交叉路口原地右旋 90 度（PR 命令）"""
         return self._track_command("PR", "路口右旋")
 
+    def pivot_u_turn(self) -> bool:
+        """交叉路口原地旋转 180 度掉头（PU 命令）"""
+        return self._track_command("PU", "路口掉头180度")
+
+    def track_until_obstacle(self) -> float | None:
+        """
+        循迹前进直到检测到障碍物（TO 命令）。
+        返回行驶距离（cm），超时返回 None
+        """
+        self._write("TO")
+        if self.simulation_mode:
+            time.sleep(0.5)
+            mock_dist = 45.0
+            print(f"  [模拟] 循迹检测到障碍物，行驶距离 {mock_dist} cm")
+            return mock_dist
+
+        reply = self._wait_for(lambda l: l.startswith(self.REPLY_DISTANCE)
+                               or l == self.REPLY_TIMEOUT,
+                               self.TRACK_TIMEOUT, desc="循迹障碍物距离")
+        if reply and reply.startswith(self.REPLY_DISTANCE):
+            try:
+                return float(reply.split(":")[1])
+            except (IndexError, ValueError):
+                return None
+        return None
+
     # ------------------------------------------------------------------
     # 编码器重置
     # ------------------------------------------------------------------
@@ -306,8 +334,10 @@ def interactive():
     print("    --- 循迹命令 (HW-511) ---")
     print("    TF             - 循迹前进至交叉路口")
     print("    TB             - 循迹倒车至交叉路口")
+    print("    TO             - 循迹前进直到检测到障碍物")
     print("    CL / CR        - 直角弯道左转 / 右转")
     print("    PL / PR        - 路口原地左旋 / 右旋 90度")
+    print("    PU             - 路口原地旋转 180度 掉头")
     print("    quit / q       - 退出")
     print("=" * 50)
 
@@ -325,8 +355,8 @@ def interactive():
             upper = raw.upper()
             if upper in ('QUIT', 'Q', 'EXIT'):
                 break
-            # --- 循迹命令（必须先于单字符 T 解析，避免 TF/TB 被当作 T 角度命令）---
-            elif upper in ('TF', 'TB', 'CL', 'CR', 'PL', 'PR'):
+            # --- 循迹命令（必须先于单字符 T 解析，避免 TF/TB/TO 被当作 T 角度命令）---
+            elif upper in ('TF', 'TB', 'CL', 'CR', 'PL', 'PR', 'PU'):
                 actions = {
                     'TF': car.track_forward,
                     'TB': car.track_backward,
@@ -334,9 +364,16 @@ def interactive():
                     'CR': car.corner_right,
                     'PL': car.pivot_left,
                     'PR': car.pivot_right,
+                    'PU': car.pivot_u_turn,
                 }
                 ok = actions[upper]()
                 print(f"  → {'成功' if ok else '失败/超时'}")
+            elif upper == 'TO':
+                dist = car.track_until_obstacle()
+                if dist is not None:
+                    print(f"  → 循迹行驶距离: {dist:.1f} cm")
+                else:
+                    print("  → 探测超时")
             elif upper == 'F':
                 car.go_forward()
             elif upper == 'B':
