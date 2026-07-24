@@ -19,7 +19,7 @@ import queue
 import sys
 
 from camera import Camera
-from card_detector import CardDetector
+from card_detector_classifier import CardDetector
 from hand_detector import HandDetector
 from request_manager import RequestManager
 # from robot_controller import RobotController # 已被 TCP 网络通信替代
