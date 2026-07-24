@@ -1,1 +1,0 @@
-1. camera height: in order to recognise the raised hand, we should either apply a bank angle to the camera or simply get it higher, which would be best? Or shall we just redefine the scene

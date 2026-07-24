@@ -23,6 +23,12 @@ volatile long encoderCountRight = 0;  // 右后轮脉冲计数
 int speedValue = 200;                // 行驶速度（0~255）
 const int OBSTACLE_DIST = 30;        // 障碍物距离阈值（cm）
 
+// ---------- 全局障碍物守护 ----------
+const unsigned long OBSTACLE_CHECK_INTERVAL = 60; // 障碍物检测最小间隔（ms），限频避免阻塞
+unsigned long lastObstacleCheck = 0;              // 上次障碍物检测时刻
+bool manualMoving = false;                        // 手动命令(F/B/L/R)运动中标志
+bool manualForward = false;                       // 手动运动是否为前进（仅前进受障碍守护）
+
 // 编码器校准（请根据实际硬件修改）
 const float CM_PER_PULSE = 20.0 / 4.0; // 每个脉冲对应 5.0 cm
 const float WHEEL_BASE = 13.0;         // 左右轮中心距（cm），需实测
@@ -44,36 +50,34 @@ const int TRACK_PIN_RR = 45;   // 5号 - 右后  (Rear Right)
 #define ON_LINE HIGH
 
 // ---------- 循迹运动参数 ----------
-const int TRACK_SPEED       = 160;    // 循迹直行基础速度（0~255）
+const int TRACK_SPEED       = 140;    // 循迹直行基础速度（0~255）
 const int TRACK_SLOW_SPEED  = 60;     // 循迹修正时内侧减速后的速度
 const int TRACK_TURN_SPEED  = 150;    // 原地旋转/弯道转向速度
 const unsigned long TRACK_TIMEOUT = 30000; // 循迹动作超时（ms）
 const unsigned long TRACK_TURN_MINTIME1 = 150; // 转向时间阈值（进入白区），超过该阈值后才可触发停下
-const unsigned long TRACK_TURN_MINTIME2 = 250; // 转向时间阈值（再次检测到黑区），超过该阈值后才可触发停下
+const unsigned long TRACK_TURN_MINTIME2 = 200; // 转向时间阈值（再次检测到黑区），超过该阈值后才可触发停下
 
 // ---------- 串口命令存储 ----------
 String command = "";
+String emergencyCommand = "";
 
 bool checkEmergencyStop() {
-  static bool discardUntilNewline = false;
-
   while (Serial.available() > 0) {
-    char received = Serial.read();
+    char incoming = Serial.read();
 
-    if (discardUntilNewline) {
-      if (received == '\n') discardUntilNewline = false;
-      continue;
-    }
+    if (incoming == '\r') continue;
+    if (incoming == '\n') {
+      emergencyCommand.trim();
+      bool emergencyStop = emergencyCommand == "S";
+      emergencyCommand = "";
 
-    if (received == 'S') {
+      if (!emergencyStop) continue;
       stopAllMotors();
       Serial.println("Emergency Stop");
-      discardUntilNewline = true;
       return true;
     }
 
-    // 运动执行期间只接收急停命令，丢弃其余完整命令，避免阻塞等待换行。
-    if (received != '\r' && received != '\n') discardUntilNewline = true;
+    emergencyCommand += incoming;
   }
   return false;
 }
@@ -84,6 +88,55 @@ bool waitWithEmergencyStop(unsigned long duration) {
     if (checkEmergencyStop()) return true;
     delay(1);
   }
+  return false;
+}
+
+bool measureDistanceWithEmergencyStop(unsigned long timeoutMicros, float& cm) {
+  digitalWrite(TRIGGER, LOW);
+  delayMicroseconds(2);
+  digitalWrite(TRIGGER, HIGH);
+  delayMicroseconds(10);
+  digitalWrite(TRIGGER, LOW);
+
+  unsigned long start = micros();
+  while (digitalRead(ECHO) == LOW) {
+    if (checkEmergencyStop()) return false;
+    if (micros() - start >= timeoutMicros) { cm = 0; return true; }
+  }
+
+  unsigned long echoStart = micros();
+  while (digitalRead(ECHO) == HIGH) {
+    if (checkEmergencyStop()) return false;
+    if (micros() - echoStart >= timeoutMicros) { cm = 0; return true; }
+  }
+
+  cm = (micros() - echoStart) / 58.2;
+  return true;
+}
+
+// ---------- 全局障碍物守护：限频测距，30cm 内立即停车 ----------
+// 注意：守护仅对前进类运动生效（F / G正值 / TF），
+// 后退与转向不受影响，否则障碍物仍在 30cm 内时小车无法脱困。
+// 返回 true 表示已因障碍物停车，调用方应中止当前动作
+bool checkObstacle() {
+  unsigned long now = millis();
+  if (now - lastObstacleCheck < OBSTACLE_CHECK_INTERVAL) return false;
+  lastObstacleCheck = now;
+
+  float cm = 0;
+  if (!measureDistanceFast(cm)) return true;
+  if (cm > 0 && cm < OBSTACLE_DIST) {
+    stopAllMotors();
+    Serial.println("Obstacle Stop");
+    return true;
+  }
+  return false;
+}
+
+// ---------- 组合检查：急停命令 或 障碍物，任一触发即中止 ----------
+bool checkStopConditions() {
+  if (checkEmergencyStop()) return true;
+  if (checkObstacle()) return true;
   return false;
 }
 
@@ -105,6 +158,7 @@ void setup() {
   Serial.println("  PN - Pivot 180-deg (U-turn) on the line");
   Serial.println("  TO - Track forward until obstacle, then send 'D:<dist>'");
   Serial.println("  (After tracking completes, 'Done' is sent)");
+  Serial.println("  Ultrasonic guard: forward motion auto-stops when obstacle < 30cm ('Obstacle Stop')");
   Serial.print("Current angle scale (fixed): ");
   Serial.println(angleScale);
 
@@ -157,7 +211,12 @@ void loop() {
     }
   }
   lastButtonState = reading;
-  
+
+  // --- 全局障碍物守护：仅手动前进(F)期间持续检测，后退/转向不受限以便脱困 ---
+  if (manualMoving && manualForward) {
+    checkObstacle();  // 触发时内部会 stopAllMotors() 并清除 manualMoving
+  }
+
   if (Serial.available() > 0) {
     command = Serial.readStringUntil('\n');
     command.trim();
@@ -249,13 +308,15 @@ void moveDistance(float dist_cm) {
   long needed = abs(targetPulses);
   long avgPulses = 0;
 
-  if (targetPulses > 0) forward(); else backward();
+  bool movingForward = (targetPulses > 0);
+  if (movingForward) forward(); else backward();
 
   unsigned long start = millis();
   unsigned long lastPrintTime = start;   // 用于控制打印频率
 
   while (avgPulses < needed) {
-    if (checkEmergencyStop()) {
+    // 障碍守护仅对前进生效；后退只响应急停命令
+    if (movingForward ? checkStopConditions() : checkEmergencyStop()) {
         return;
     }
     
@@ -280,7 +341,7 @@ void moveDistance(float dist_cm) {
       Serial.println("Timeout");
       return;
     }
-    if (waitWithEmergencyStop(1)) return;
+    delay(1);
   }
   stopAllMotors();
 
@@ -290,6 +351,7 @@ void moveDistance(float dist_cm) {
   Serial.print(abs(encoderCountRight));
   Serial.print(" Avg:");
   Serial.println((abs(encoderCountLeft) + abs(encoderCountRight)) / 2);
+  if (waitWithEmergencyStop(1000)) return;
   Serial.println("Done");
 }
 
@@ -334,6 +396,7 @@ void turnAngle(float angle_deg) {
 
   while (avgPulses < needed) {
 
+    // 原地旋转不受障碍守护限制（否则障碍物前无法转向脱困）
     if (checkEmergencyStop()) {
         return;
     }
@@ -359,7 +422,7 @@ void turnAngle(float angle_deg) {
       Serial.println("Timeout");
       return;
     }
-    if (waitWithEmergencyStop(1)) return;
+    delay(1);
   }
   stopAllMotors();
 
@@ -369,6 +432,7 @@ void turnAngle(float angle_deg) {
   Serial.print(abs(encoderCountRight));
   Serial.print(" Avg:");
   Serial.println((abs(encoderCountLeft) + abs(encoderCountRight)) / 2);
+  if (waitWithEmergencyStop(1000)) return;
   Serial.println("Done");
 }
 
@@ -384,8 +448,8 @@ void driveUntilObstacle() {
     if (checkEmergencyStop()) {
         return;
     }
-    float cm = measureDistance();
-    if (cm < 0) return;
+    float cm = 0;
+    if (!measureDistance(cm)) return;
     if (cm > 0 && cm < OBSTACLE_DIST) {
       stopAllMotors();
       
@@ -408,27 +472,14 @@ void driveUntilObstacle() {
 }
 
 // ========== 测距函数 ==========
-float measureDistance() {
-  digitalWrite(TRIGGER, LOW);
-  delayMicroseconds(2);
-  digitalWrite(TRIGGER, HIGH);
-  delayMicroseconds(10);
-  digitalWrite(TRIGGER, LOW);
+bool measureDistance(float& cm) {
+  return measureDistanceWithEmergencyStop(30000, cm);
+}
 
-  // 不使用 pulseIn：它最长会阻塞 30 ms，期间无法处理 S。
-  unsigned long start = micros();
-  while (digitalRead(ECHO) == LOW) {
-    if (checkEmergencyStop()) return -1;
-    if (micros() - start >= 30000UL) return 0;
-  }
-
-  unsigned long echoStart = micros();
-  while (digitalRead(ECHO) == HIGH) {
-    if (checkEmergencyStop()) return -1;
-    if (micros() - echoStart >= 30000UL) return 0;
-  }
-
-  return (micros() - echoStart) / 58.2;
+// ========== 快速测距（守护专用，短超时避免阻塞循迹循环） ==========
+// 超时 5000us ≈ 最远约 86cm，足以判断 30cm 阈值；无回波返回 0（视为无障碍）
+bool measureDistanceFast(float& cm) {
+  return measureDistanceWithEmergencyStop(5000, cm);
 }
 
 // ========== 电机控制函数 ==========
@@ -437,6 +488,8 @@ void forward() {
   motor2.run(FORWARD);
   motor3.run(FORWARD);
   motor4.run(FORWARD);
+  manualMoving = true;
+  manualForward = true;
   Serial.println("Forward");
 }
 
@@ -445,6 +498,8 @@ void backward() {
   motor2.run(BACKWARD);
   motor3.run(BACKWARD);
   motor4.run(BACKWARD);
+  manualMoving = true;
+  manualForward = false;
   Serial.println("Backward");
 }
 
@@ -453,6 +508,8 @@ void turnLeft() {
   motor2.run(FORWARD);
   motor3.run(FORWARD);
   motor4.run(BACKWARD);
+  manualMoving = true;
+  manualForward = false;
   Serial.println("Turn Left");
 }
 
@@ -461,6 +518,8 @@ void turnRight() {
   motor2.run(BACKWARD);
   motor3.run(BACKWARD);
   motor4.run(FORWARD);
+  manualMoving = true;
+  manualForward = false;
   Serial.println("Turn Right");
 }
 
@@ -469,6 +528,8 @@ void stopAllMotors() {
   motor2.run(RELEASE);
   motor3.run(RELEASE);
   motor4.run(RELEASE);
+  manualMoving = false;
+  manualForward = false;
   Serial.println("Stopped");
 }
 
@@ -539,6 +600,9 @@ void stopSilent() {
 void trackFinish(const char* msg) {
   stopSilent();
   restoreSpeed();
+  if (String(msg) == "Done") {
+    if (waitWithEmergencyStop(1000)) return;
+  }
   Serial.println(msg);
 }
 
@@ -560,7 +624,7 @@ void trackForward(int nStop) {
   int crossCount = 0;
 
   while (true) {
-    if (checkEmergencyStop()) { restoreSpeed(); return; }
+    if (checkStopConditions()) { restoreSpeed(); return; }
     if (millis() - start > TRACK_TIMEOUT) { trackFinish("Timeout"); return; }
 
     bool fl = onLine(TRACK_PIN_FL);  // 左前
@@ -574,7 +638,7 @@ void trackForward(int nStop) {
       crossCount++;
       if (crossCount >= nStop) {
         // 【关键数据】补偿运动的时间
-        if (waitWithEmergencyStop(60)) { restoreSpeed(); return; }  // 满电量时数据
+        if (waitWithEmergencyStop(40)) { restoreSpeed(); return; }  // 满电量、长距离直线运动后
         // delay(80);  // 中等电量时数据
         // 低电量时数据（待测）
         trackFinish("Done");
@@ -584,7 +648,7 @@ void trackForward(int nStop) {
       setSideSpeed(TRACK_SPEED, TRACK_SPEED);
       driveForwardSilent();
       while (onLine(TRACK_PIN_ML) || onLine(TRACK_PIN_MR)) {
-        if (checkEmergencyStop()) { restoreSpeed(); return; }
+        if (checkStopConditions()) { restoreSpeed(); return; }
         if (millis() - start > TRACK_TIMEOUT) { trackFinish("Timeout"); return; }
         if (waitWithEmergencyStop(2)) { restoreSpeed(); return; }
       }
@@ -622,6 +686,7 @@ void trackBackward(int nStop) {
   int crossCount = 0;
 
   while (true) {
+    // 倒车不受障碍守护限制（超声波朝前，且需允许退离障碍）
     if (checkEmergencyStop()) { restoreSpeed(); return; }
     if (millis() - start > TRACK_TIMEOUT) { trackFinish("Timeout"); return; }
 
@@ -694,6 +759,7 @@ void cornerTurn(bool leftTurn) {
   if (leftTurn) rotateLeftSilent();
   else          rotateRightSilent();
 
+  // 转向过程不受障碍守护限制（需允许在障碍物前转向脱困）
   // ---- 阶段1：等待前端离开当前黑线（两前端均为白 LOW）----
   while (onLine(TRACK_PIN_FL) || onLine(TRACK_PIN_FR)) {
     if (checkEmergencyStop()) { restoreSpeed(); return; }
@@ -733,6 +799,7 @@ void pivotLeft() {
 
   rotateLeftSilent();
 
+  // 原地旋转不受障碍守护限制
   // ---- 阶段1：等待左前传感器离开黑线，进入白区（LOW）----
   while (onLine(TRACK_PIN_FL) || millis() - start < TRACK_TURN_MINTIME1) {
     if (checkEmergencyStop()) { restoreSpeed(); return; }
@@ -771,8 +838,8 @@ void trackForwardUntilObstacle() {
     if (millis() - start > TRACK_TIMEOUT) { trackFinish("Timeout"); return; }
 
     // 【障碍物判定】与 O 命令相同的距离阈值
-    float cm = measureDistance();
-    if (cm < 0) { restoreSpeed(); return; }
+    float cm = 0;
+    if (!measureDistance(cm)) { restoreSpeed(); return; }
     if (cm > 0 && cm < OBSTACLE_DIST) {
       stopSilent();
       restoreSpeed();
@@ -787,6 +854,7 @@ void trackForwardUntilObstacle() {
 
       Serial.print("D:");
       Serial.println(traveled_cm);
+      if (waitWithEmergencyStop(1000)) return;
       Serial.println("Done");
       return;
     }
@@ -830,6 +898,7 @@ void pivotRight() {
 
   rotateRightSilent();
 
+  // 原地旋转不受障碍守护限制
   // ---- 阶段1：等待右前传感器离开黑线，进入白区（LOW）----
   while (onLine(TRACK_PIN_FR) || millis() - start < TRACK_TURN_MINTIME1) {
     if (checkEmergencyStop()) { restoreSpeed(); return; }
@@ -870,6 +939,7 @@ void pivotUTurn() {
   for (int seg = 0; seg < 2; seg++) {
     unsigned long segStart = millis();
 
+    // 原地旋转不受障碍守护限制
     // ---- 阶段1：等待左前传感器离开黑线，进入白区（LOW）----
     while (onLine(TRACK_PIN_FL) || millis() - segStart < TRACK_TURN_MINTIME1) {
       if (checkEmergencyStop()) { restoreSpeed(); return; }
