@@ -310,6 +310,7 @@ void moveDistance(float dist_cm) {
   Serial.print(abs(encoderCountRight));
   Serial.print(" Avg:");
   Serial.println((abs(encoderCountLeft) + abs(encoderCountRight)) / 2);
+  delay(1000);  // 指令执行完成后延时 1 秒再回复 Done
   Serial.println("Done");
 }
 
@@ -390,6 +391,7 @@ void turnAngle(float angle_deg) {
   Serial.print(abs(encoderCountRight));
   Serial.print(" Avg:");
   Serial.println((abs(encoderCountLeft) + abs(encoderCountRight)) / 2);
+  delay(1000);  // 指令执行完成后延时 1 秒再回复 Done
   Serial.println("Done");
 }
 
@@ -568,6 +570,9 @@ void stopSilent() {
 void trackFinish(const char* msg) {
   stopSilent();
   restoreSpeed();
+  if (String(msg) == "Done") {
+    delay(1000);  // 指令执行完成后延时 1 秒再回复 Done
+  }
   Serial.println(msg);
 }
 
@@ -818,6 +823,7 @@ void trackForwardUntilObstacle() {
 
       Serial.print("D:");
       Serial.println(traveled_cm);
+      delay(1000);  // 指令执行完成后延时 1 秒再回复 Done
       Serial.println("Done");
       return;
     }
