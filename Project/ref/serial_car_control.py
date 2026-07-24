@@ -15,8 +15,8 @@ serial_car_control.py
     RST       - 重置编码器计数
 
 循迹命令（HW-511 模块，完成后均返回 "Done"）:
-    TF        - 循迹前进，直到到达交叉路口中央
-    TB        - 循迹倒车，直到退至交叉路口中央
+    TF [n]    - 循迹前进，直到到达连续第 n 个交叉路口中央（默认 1）
+    TB [n]    - 循迹倒车，直到退至连续第 n 个交叉路口中央（默认 1）
     TO        - 循迹前进直到检测到障碍物，返回行驶距离（cm，格式 D:<dist>）
     CL / CR   - 直角弯道沿黑线左转 / 右转 90 度
     PL / PR   - 交叉路口原地左旋 / 右旋 90 度
@@ -243,13 +243,21 @@ class CarSerial:
                                self.TRACK_TIMEOUT, desc=desc)
         return reply == self.REPLY_DONE
 
-    def track_forward(self) -> bool:
-        """循迹前进至交叉路口中央（TF 命令），返回 True 表示成功"""
-        return self._track_command("TF", "循迹前进")
+    def track_forward(self, n: int = 1) -> bool:
+        """循迹前进至连续第 n 个交叉路口中央（TF [n] 命令，默认 1），返回 True 表示成功"""
+        if n < 1:
+            print(f"  [错误] 路口数必须 >= 1: {n}")
+            return False
+        cmd = "TF" if n == 1 else f"TF {n}"
+        return self._track_command(cmd, f"循迹前进至第{n}个路口")
 
-    def track_backward(self) -> bool:
-        """循迹倒车至交叉路口中央（TB 命令），返回 True 表示成功"""
-        return self._track_command("TB", "循迹倒车")
+    def track_backward(self, n: int = 1) -> bool:
+        """循迹倒车至连续第 n 个交叉路口中央（TB [n] 命令，默认 1），返回 True 表示成功"""
+        if n < 1:
+            print(f"  [错误] 路口数必须 >= 1: {n}")
+            return False
+        cmd = "TB" if n == 1 else f"TB {n}"
+        return self._track_command(cmd, f"循迹倒车至第{n}个路口")
 
     def corner_left(self) -> bool:
         """直角弯道沿黑线左转 90 度（CL 命令）"""
@@ -336,8 +344,8 @@ def interactive():
     print("    O              - 前进直到检测到障碍物")
     print("    RST            - 重置编码器")
     print("    --- 循迹命令 (HW-511) ---")
-    print("    TF             - 循迹前进至交叉路口")
-    print("    TB             - 循迹倒车至交叉路口")
+    print("    TF [n]         - 循迹前进至连续第 n 个交叉路口（默认 1）")
+    print("    TB [n]         - 循迹倒车至连续第 n 个交叉路口（默认 1）")
     print("    TO             - 循迹前进直到检测到障碍物")
     print("    CL / CR        - 直角弯道左转 / 右转")
     print("    PL / PR        - 路口原地左旋 / 右旋 90度")
@@ -361,10 +369,18 @@ def interactive():
             if upper in ('QUIT', 'Q', 'EXIT'):
                 break
             # --- 循迹命令（必须先于单字符 T 解析，避免 TF/TB/TO 被当作 T 角度命令）---
-            elif upper in ('TF', 'TB', 'CL', 'CR', 'PL', 'PR', 'PU', 'PN'):
+            elif upper in ('TF', 'TB') or upper.startswith(('TF ', 'TB ')):
+                param = raw[2:].strip()
+                try:
+                    n = int(param) if param else 1
+                except ValueError:
+                    print("  → 用法: TF   或   TF 3")
+                    continue
+                action = car.track_forward if upper.startswith('TF') else car.track_backward
+                ok = action(n)
+                print(f"  → {'成功' if ok else '失败/超时'}")
+            elif upper in ('CL', 'CR', 'PL', 'PR', 'PU', 'PN'):
                 actions = {
-                    'TF': car.track_forward,
-                    'TB': car.track_backward,
                     'CL': car.corner_left,
                     'CR': car.corner_right,
                     'PL': car.pivot_left,

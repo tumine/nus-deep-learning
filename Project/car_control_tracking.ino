@@ -78,8 +78,8 @@ void setup() {
   Serial.println("  (After G/T completes, 'Done' is sent)");
   Serial.println("  RST - Reset encoder counts");
   Serial.println("  --- Line tracking (HW-511) ---");
-  Serial.println("  TF - Track forward until intersection");
-  Serial.println("  TB - Track backward until intersection");
+  Serial.println("  TF [n] - Track forward until nth intersection (default 1)");
+  Serial.println("  TB [n] - Track backward until nth intersection (default 1)");
   Serial.println("  CL/CR - Follow 90-deg corner, turn left/right");
   Serial.println("  PL/PR - Pivot 90-deg left/right at intersection");
   Serial.println("  PU - Pivot 180-deg (U-turn) on the intersection");
@@ -145,8 +145,18 @@ void loop() {
     if (command.length() == 0) return;
 
     // ---------- 循迹类多字符命令（必须先于单字符解析，避免 "TF" 被 'T' 吞掉） ----------
-    if (command == "TF")      { trackForward();     return; }
-    else if (command == "TB") { trackBackward();    return; }
+    if (command == "TF" || command.startsWith("TF ")) {
+      int n = parseIntersectionCount(command.substring(2));
+      if (n <= 0) { Serial.println("Invalid intersection count"); return; }
+      trackForward(n);
+      return;
+    }
+    else if (command == "TB" || command.startsWith("TB ")) {
+      int n = parseIntersectionCount(command.substring(2));
+      if (n <= 0) { Serial.println("Invalid intersection count"); return; }
+      trackBackward(n);
+      return;
+    }
     else if (command == "TO") { trackForwardUntilObstacle(); return; }
     else if (command == "CL") { cornerTurn(true);   return; }
     else if (command == "CR") { cornerTurn(false);  return; }
@@ -499,12 +509,22 @@ void trackFinish(const char* msg) {
   Serial.println(msg);
 }
 
+// ---------- 解析 TF/TB 的可选路口数参数：空串默认 1，非法返回 -1 ----------
+int parseIntersectionCount(String param) {
+  param.trim();
+  if (param.length() == 0) return 1;
+  int n = param.toInt();
+  if (n <= 0) return -1;
+  return n;
+}
+
 // ==========================================================
-// TF：循迹直行（前进），直到到达交叉路口中央
+// TF [n]：循迹直行（前进），直到到达连续第 n 个交叉路口中央
 // 使用前端（0,1号）做方向修正，中部（2,3号）判定交叉口
 // ==========================================================
-void trackForward() {
+void trackForward(int nStop) {
   unsigned long start = millis();
+  int crossCount = 0;
 
   while (true) {
     if (checkEmergencyStop()) { restoreSpeed(); return; }
@@ -516,14 +536,26 @@ void trackForward() {
     bool mr = onLine(TRACK_PIN_MR);  // 右中
 
     // 【交叉口判定】中部左右两个传感器同时压黑：
-    // 说明横向黑线已经到达车身中部，车体中心位于路口中央 → 停车
+    // 说明横向黑线已经到达车身中部，车体中心位于路口中央
     if (ml && mr) {
-      // 【关键数据】补偿运动的时间
-      delay(60);  // 满电量时数据
-      // delay(80);  // 中等电量时数据
-      // 低电量时数据（待测）
-      trackFinish("Done");
-      return;
+      crossCount++;
+      if (crossCount >= nStop) {
+        // 【关键数据】补偿运动的时间
+        delay(60);  // 满电量时数据
+        // delay(80);  // 中等电量时数据
+        // 低电量时数据（待测）
+        trackFinish("Done");
+        return;
+      }
+      // 未到目标路口：直行穿过横线，直到中部传感器离开黑线，避免重复计数
+      setSideSpeed(TRACK_SPEED, TRACK_SPEED);
+      driveForwardSilent();
+      while (onLine(TRACK_PIN_ML) || onLine(TRACK_PIN_MR)) {
+        if (checkEmergencyStop()) { restoreSpeed(); return; }
+        if (millis() - start > TRACK_TIMEOUT) { trackFinish("Timeout"); return; }
+        delay(2);
+      }
+      continue;
     }
 
     // 【方向修正】理想状态：黑线位于两前端传感器之间，0/1号都在白色区域
@@ -549,11 +581,12 @@ void trackForward() {
 }
 
 // ==========================================================
-// TB：循迹倒车（后退），直到退至交叉路口中央
+// TB [n]：循迹倒车（后退），直到退至连续第 n 个交叉路口中央
 // 使用后端（4,5号）做方向修正，中部（2,3号）判定交叉口
 // ==========================================================
-void trackBackward() {
+void trackBackward(int nStop) {
   unsigned long start = millis();
+  int crossCount = 0;
 
   while (true) {
     if (checkEmergencyStop()) { restoreSpeed(); return; }
@@ -564,10 +597,22 @@ void trackBackward() {
     bool ml = onLine(TRACK_PIN_ML);  // 左中
     bool mr = onLine(TRACK_PIN_MR);  // 右中
 
-    // 【交叉口判定】中部左右同时压黑 → 车体中心退到路口中央 → 停车
+    // 【交叉口判定】中部左右同时压黑 → 车体中心退到路口中央
     if (ml && mr) {
-      trackFinish("Done");
-      return;
+      crossCount++;
+      if (crossCount >= nStop) {
+        trackFinish("Done");
+        return;
+      }
+      // 未到目标路口：继续后退穿过横线，直到中部传感器离开黑线，避免重复计数
+      setSideSpeed(TRACK_SPEED, TRACK_SPEED);
+      driveBackwardSilent();
+      while (onLine(TRACK_PIN_ML) || onLine(TRACK_PIN_MR)) {
+        if (checkEmergencyStop()) { restoreSpeed(); return; }
+        if (millis() - start > TRACK_TIMEOUT) { trackFinish("Timeout"); return; }
+        delay(2);
+      }
+      continue;
     }
 
     // 【方向修正】倒车时以后端传感器为准：
