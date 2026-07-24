@@ -91,6 +91,29 @@ bool waitWithEmergencyStop(unsigned long duration) {
   return false;
 }
 
+bool measureDistanceWithEmergencyStop(unsigned long timeoutMicros, float& cm) {
+  digitalWrite(TRIGGER, LOW);
+  delayMicroseconds(2);
+  digitalWrite(TRIGGER, HIGH);
+  delayMicroseconds(10);
+  digitalWrite(TRIGGER, LOW);
+
+  unsigned long start = micros();
+  while (digitalRead(ECHO) == LOW) {
+    if (checkEmergencyStop()) return false;
+    if (micros() - start >= timeoutMicros) { cm = 0; return true; }
+  }
+
+  unsigned long echoStart = micros();
+  while (digitalRead(ECHO) == HIGH) {
+    if (checkEmergencyStop()) return false;
+    if (micros() - echoStart >= timeoutMicros) { cm = 0; return true; }
+  }
+
+  cm = (micros() - echoStart) / 58.2;
+  return true;
+}
+
 // ---------- 全局障碍物守护：限频测距，30cm 内立即停车 ----------
 // 注意：守护仅对前进类运动生效（F / G正值 / TF），
 // 后退与转向不受影响，否则障碍物仍在 30cm 内时小车无法脱困。
@@ -100,7 +123,8 @@ bool checkObstacle() {
   if (now - lastObstacleCheck < OBSTACLE_CHECK_INTERVAL) return false;
   lastObstacleCheck = now;
 
-  float cm = measureDistanceFast();
+  float cm = 0;
+  if (!measureDistanceFast(cm)) return true;
   if (cm > 0 && cm < OBSTACLE_DIST) {
     stopAllMotors();
     Serial.println("Obstacle Stop");
@@ -327,7 +351,7 @@ void moveDistance(float dist_cm) {
   Serial.print(abs(encoderCountRight));
   Serial.print(" Avg:");
   Serial.println((abs(encoderCountLeft) + abs(encoderCountRight)) / 2);
-  delay(1000);  // 指令执行完成后延时 1 秒再回复 Done
+  if (waitWithEmergencyStop(1000)) return;
   Serial.println("Done");
 }
 
@@ -408,7 +432,7 @@ void turnAngle(float angle_deg) {
   Serial.print(abs(encoderCountRight));
   Serial.print(" Avg:");
   Serial.println((abs(encoderCountLeft) + abs(encoderCountRight)) / 2);
-  delay(1000);  // 指令执行完成后延时 1 秒再回复 Done
+  if (waitWithEmergencyStop(1000)) return;
   Serial.println("Done");
 }
 
@@ -424,7 +448,8 @@ void driveUntilObstacle() {
     if (checkEmergencyStop()) {
         return;
     }
-    float cm = measureDistance();
+    float cm = 0;
+    if (!measureDistance(cm)) return;
     if (cm > 0 && cm < OBSTACLE_DIST) {
       stopAllMotors();
       
@@ -442,31 +467,19 @@ void driveUntilObstacle() {
       break;
     }
     forward();
-    delay(50);
+    if (waitWithEmergencyStop(50)) return;
   }
 }
 
 // ========== 测距函数 ==========
-float measureDistance() {
-  digitalWrite(TRIGGER, LOW);
-  delayMicroseconds(2);
-  digitalWrite(TRIGGER, HIGH);
-  delayMicroseconds(10);
-  digitalWrite(TRIGGER, LOW);
-  unsigned long duration = pulseIn(ECHO, HIGH, 30000);
-  return duration / 58.2;
+bool measureDistance(float& cm) {
+  return measureDistanceWithEmergencyStop(30000, cm);
 }
 
 // ========== 快速测距（守护专用，短超时避免阻塞循迹循环） ==========
 // 超时 5000us ≈ 最远约 86cm，足以判断 30cm 阈值；无回波返回 0（视为无障碍）
-float measureDistanceFast() {
-  digitalWrite(TRIGGER, LOW);
-  delayMicroseconds(2);
-  digitalWrite(TRIGGER, HIGH);
-  delayMicroseconds(10);
-  digitalWrite(TRIGGER, LOW);
-  unsigned long duration = pulseIn(ECHO, HIGH, 5000);
-  return duration / 58.2;
+bool measureDistanceFast(float& cm) {
+  return measureDistanceWithEmergencyStop(5000, cm);
 }
 
 // ========== 电机控制函数 ==========
@@ -588,7 +601,7 @@ void trackFinish(const char* msg) {
   stopSilent();
   restoreSpeed();
   if (String(msg) == "Done") {
-    delay(1000);  // 指令执行完成后延时 1 秒再回复 Done
+    if (waitWithEmergencyStop(1000)) return;
   }
   Serial.println(msg);
 }
@@ -637,7 +650,7 @@ void trackForward(int nStop) {
       while (onLine(TRACK_PIN_ML) || onLine(TRACK_PIN_MR)) {
         if (checkStopConditions()) { restoreSpeed(); return; }
         if (millis() - start > TRACK_TIMEOUT) { trackFinish("Timeout"); return; }
-        delay(2);
+        if (waitWithEmergencyStop(2)) { restoreSpeed(); return; }
       }
       continue;
     }
@@ -660,7 +673,7 @@ void trackForward(int nStop) {
       setSideSpeed(TRACK_SPEED, TRACK_SPEED);
       driveForwardSilent();
     }
-    delay(5);
+    if (waitWithEmergencyStop(5)) { restoreSpeed(); return; }
   }
 }
 
@@ -695,7 +708,7 @@ void trackBackward(int nStop) {
       while (onLine(TRACK_PIN_ML) || onLine(TRACK_PIN_MR)) {
         if (checkEmergencyStop()) { restoreSpeed(); return; }
         if (millis() - start > TRACK_TIMEOUT) { trackFinish("Timeout"); return; }
-        delay(2);
+        if (waitWithEmergencyStop(2)) { restoreSpeed(); return; }
       }
       continue;
     }
@@ -723,7 +736,7 @@ void trackBackward(int nStop) {
       if (waitWithEmergencyStop(50)) { restoreSpeed(); return; }
       driveBackwardSilent();
     }
-    delay(5);
+    if (waitWithEmergencyStop(5)) { restoreSpeed(); return; }
   }
 }
 
@@ -751,14 +764,14 @@ void cornerTurn(bool leftTurn) {
   while (onLine(TRACK_PIN_FL) || onLine(TRACK_PIN_FR)) {
     if (checkEmergencyStop()) { restoreSpeed(); return; }
     if (millis() - start > TRACK_TIMEOUT) { trackFinish("Timeout"); return; }
-    delay(2);
+    if (waitWithEmergencyStop(2)) { restoreSpeed(); return; }
   }
 
   // ---- 阶段2：继续旋转，直到内侧前端重新压到新方向黑线（HIGH）----
   while (!onLine(innerFrontPin)) {
     if (checkEmergencyStop()) { restoreSpeed(); return; }
     if (millis() - start > TRACK_TIMEOUT) { trackFinish("Timeout"); return; }
-    delay(2);
+    if (waitWithEmergencyStop(2)) { restoreSpeed(); return; }
   }
 
   // ---- 阶段3：继续旋转少许，让内侧传感器越过黑线回到白区，
@@ -766,7 +779,7 @@ void cornerTurn(bool leftTurn) {
   while (onLine(innerFrontPin)) {
     if (checkEmergencyStop()) { restoreSpeed(); return; }
     if (millis() - start > TRACK_TIMEOUT) { trackFinish("Timeout"); return; }
-    delay(2);
+    if (waitWithEmergencyStop(2)) { restoreSpeed(); return; }
   }
 
   trackFinish("Done");
@@ -791,7 +804,7 @@ void pivotLeft() {
   while (onLine(TRACK_PIN_FL) || millis() - start < TRACK_TURN_MINTIME1) {
     if (checkEmergencyStop()) { restoreSpeed(); return; }
     if (millis() - start > TRACK_TIMEOUT) { trackFinish("Timeout"); return; }
-    delay(2);
+    if (waitWithEmergencyStop(2)) { restoreSpeed(); return; }
   }
 
   // ---- 阶段2：继续左旋，直到左前传感器再次压到黑线（HIGH），
@@ -799,7 +812,7 @@ void pivotLeft() {
   while (!onLine(TRACK_PIN_FL) || millis() - start < TRACK_TURN_MINTIME2) {
     if (checkEmergencyStop()) { restoreSpeed(); return; }
     if (millis() - start > TRACK_TIMEOUT) { trackFinish("Timeout"); return; }
-    delay(2);
+    if (waitWithEmergencyStop(2)) { restoreSpeed(); return; }
   }
 
   trackFinish("Done");
@@ -825,7 +838,8 @@ void trackForwardUntilObstacle() {
     if (millis() - start > TRACK_TIMEOUT) { trackFinish("Timeout"); return; }
 
     // 【障碍物判定】与 O 命令相同的距离阈值
-    float cm = measureDistance();
+    float cm = 0;
+    if (!measureDistance(cm)) { restoreSpeed(); return; }
     if (cm > 0 && cm < OBSTACLE_DIST) {
       stopSilent();
       restoreSpeed();
@@ -840,7 +854,7 @@ void trackForwardUntilObstacle() {
 
       Serial.print("D:");
       Serial.println(traveled_cm);
-      delay(1000);  // 指令执行完成后延时 1 秒再回复 Done
+      if (waitWithEmergencyStop(1000)) return;
       Serial.println("Done");
       return;
     }
@@ -866,7 +880,7 @@ void trackForwardUntilObstacle() {
       setSideSpeed(TRACK_SPEED, TRACK_SPEED);
       driveForwardSilent();
     }
-    delay(5);
+    if (waitWithEmergencyStop(5)) { restoreSpeed(); return; }
   }
 }
 
@@ -889,7 +903,7 @@ void pivotRight() {
   while (onLine(TRACK_PIN_FR) || millis() - start < TRACK_TURN_MINTIME1) {
     if (checkEmergencyStop()) { restoreSpeed(); return; }
     if (millis() - start > TRACK_TIMEOUT) { trackFinish("Timeout"); return; }
-    delay(2);
+    if (waitWithEmergencyStop(2)) { restoreSpeed(); return; }
   }
 
   // ---- 阶段2：继续右旋，直到右前传感器再次压到黑线（HIGH），
@@ -897,7 +911,7 @@ void pivotRight() {
   while (!onLine(TRACK_PIN_FR) || millis() - start < TRACK_TURN_MINTIME2) {
     if (checkEmergencyStop()) { restoreSpeed(); return; }
     if (millis() - start > TRACK_TIMEOUT) { trackFinish("Timeout"); return; }
-    delay(2);
+    if (waitWithEmergencyStop(2)) { restoreSpeed(); return; }
   }
 
   trackFinish("Done");
@@ -930,14 +944,14 @@ void pivotUTurn() {
     while (onLine(TRACK_PIN_FL) || millis() - segStart < TRACK_TURN_MINTIME1) {
       if (checkEmergencyStop()) { restoreSpeed(); return; }
       if (millis() - start > TRACK_TIMEOUT) { trackFinish("Timeout"); return; }
-      delay(2);
+      if (waitWithEmergencyStop(2)) { restoreSpeed(); return; }
     }
 
     // ---- 阶段2：继续左旋，直到左前传感器再次压到黑线（HIGH）----
     while (!onLine(TRACK_PIN_FL) || millis() - segStart < TRACK_TURN_MINTIME2) {
       if (checkEmergencyStop()) { restoreSpeed(); return; }
       if (millis() - start > TRACK_TIMEOUT) { trackFinish("Timeout"); return; }
-      delay(2);
+      if (waitWithEmergencyStop(2)) { restoreSpeed(); return; }
     }
   }
 
