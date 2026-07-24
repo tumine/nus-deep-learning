@@ -19,7 +19,7 @@ import queue
 import sys
 
 from camera import Camera
-from card_detector_classifier import CardDetector
+from card_detector import CardDetector
 from hand_detector import HandDetector
 from request_manager import RequestManager
 # from robot_controller import RobotController # 已被 TCP 网络通信替代
@@ -28,6 +28,7 @@ from task_queue import TaskQueue
 
 from ui_manager import UIManager
 from ui_server import UIServer
+from teacher_notifier import TeacherNotifier
 
 # ==============================================================================
 # ⚠️ 系统及网络配置区 
@@ -44,6 +45,10 @@ DEFAULT_APPROACH_SECONDS = 1.5
 # 请将这里的 IP 地址改为小车连接 WiFi 后分配到的真实 IP 地址！
 ROBOT_IP = "100.84.2.68" 
 ROBOT_PORT = 9999
+
+# 教师端 teacher_client.py 默认监听 8000；本模块网页 UI 使用 8001，避免端口冲突。
+TEACHER_WS_URL = "ws://127.0.0.1:8000/ws"
+UI_SERVER_PORT = 8001
 # ==============================================================================
 
 
@@ -234,10 +239,12 @@ def main():
 
     ui_manager = UIManager()
 
+    teacher_notifier = TeacherNotifier(TEACHER_WS_URL)
+
     ui_server = UIServer(
         ui_manager=ui_manager,
         host="0.0.0.0",
-        port=8000,
+        port=UI_SERVER_PORT,
     )
 
     ui_server.start_in_thread()
@@ -457,12 +464,14 @@ def main():
                     )
 
                     card_event = card_events[0]
+                    request = card_event.get("request")
+                    teacher_notifier.notify_request(request)
                     center = card_event.get("center")
                     axis_x = center[0] if center else None
                     axis_y = center[1] if center else None
                     ui_manager.update_request(
-                        request_type="物品",
-                        description=card_event.get("request", "unknown"),
+                        request_type="教师协助" if request == "teacher" else "物品",
+                        description=request or "unknown",
                         message_id=f"ARUCO-{card_event.get('id', 'unknown')}",
                         axis_x=axis_x,
                         axis_y=axis_y,
@@ -603,6 +612,7 @@ def main():
 
     finally:
         print("[MAIN] Releasing resources...")
+        teacher_notifier.close()
         if tcp_socket is not None:
             try:
                 print("[SAFETY] Sending stop command before shutdown...")
