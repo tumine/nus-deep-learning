@@ -50,12 +50,12 @@ const int TRACK_PIN_RR = 45;   // 5号 - 右后  (Rear Right)
 #define ON_LINE HIGH
 
 // ---------- 循迹运动参数 ----------
-const int TRACK_SPEED       = 160;    // 循迹直行基础速度（0~255）
+const int TRACK_SPEED       = 140;    // 循迹直行基础速度（0~255）
 const int TRACK_SLOW_SPEED  = 60;     // 循迹修正时内侧减速后的速度
 const int TRACK_TURN_SPEED  = 150;    // 原地旋转/弯道转向速度
 const unsigned long TRACK_TIMEOUT = 30000; // 循迹动作超时（ms）
 const unsigned long TRACK_TURN_MINTIME1 = 150; // 转向时间阈值（进入白区），超过该阈值后才可触发停下
-const unsigned long TRACK_TURN_MINTIME2 = 250; // 转向时间阈值（再次检测到黑区），超过该阈值后才可触发停下
+const unsigned long TRACK_TURN_MINTIME2 = 200; // 转向时间阈值（再次检测到黑区），超过该阈值后才可触发停下
 
 // ---------- 串口命令存储 ----------
 String command = "";
@@ -603,7 +603,7 @@ void trackForward(int nStop) {
       crossCount++;
       if (crossCount >= nStop) {
         // 【关键数据】补偿运动的时间
-        delay(60);  // 满电量时数据
+        delay(40);  // 满电量、长距离直线运动后
         // delay(80);  // 中等电量时数据
         // 低电量时数据（待测）
         trackFinish("Done");
