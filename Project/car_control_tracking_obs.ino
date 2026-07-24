@@ -59,34 +59,17 @@ const unsigned long TRACK_TURN_MINTIME2 = 200; // 转向时间阈值（再次检
 
 // ---------- 串口命令存储 ----------
 String command = "";
-String emergencyCommand = "";
 
 bool checkEmergencyStop() {
-  while (Serial.available() > 0) {
-    char incoming = Serial.read();
+  if (Serial.available() > 0) {
+    String cmd = Serial.readStringUntil('\n');
+    cmd.trim();
 
-    if (incoming == '\r') continue;
-    if (incoming == '\n') {
-      emergencyCommand.trim();
-      bool emergencyStop = emergencyCommand == "S";
-      emergencyCommand = "";
-
-      if (!emergencyStop) continue;
+    if (cmd == "S") {
       stopAllMotors();
       Serial.println("Emergency Stop");
       return true;
     }
-
-    emergencyCommand += incoming;
-  }
-  return false;
-}
-
-bool waitWithEmergencyStop(unsigned long duration) {
-  unsigned long start = millis();
-  while (millis() - start < duration) {
-    if (checkEmergencyStop()) return true;
-    delay(1);
   }
   return false;
 }
@@ -625,7 +608,7 @@ void trackForward(int nStop) {
       crossCount++;
       if (crossCount >= nStop) {
         // 【关键数据】补偿运动的时间
-        if (waitWithEmergencyStop(40)) { restoreSpeed(); return; }  // 满电量、长距离直线运动后
+        delay(40);  // 满电量、长距离直线运动后
         // delay(80);  // 中等电量时数据
         // 低电量时数据（待测）
         trackFinish("Done");
@@ -705,22 +688,22 @@ void trackBackward(int nStop) {
     if (rl && rr) {
       // 两后端同时压黑：多为碰到路口横线，继续后退交给中部确认
       setSideSpeed(TRACK_SPEED, TRACK_SPEED);
-      if (waitWithEmergencyStop(50)) { restoreSpeed(); return; }
+      delay(50);
       driveBackwardSilent();
     } else if (rl) {
       // 仅左后压黑：黑线偏向车尾左侧 → 左侧减速，让车尾向左靠回黑线
       setSideSpeed(TRACK_SLOW_SPEED, TRACK_SPEED + 40);
-      if (waitWithEmergencyStop(50)) { restoreSpeed(); return; }
+      delay(50);
       driveBackwardSilent();
     } else if (rr) {
       // 仅右后压黑：黑线偏向车尾右侧 → 右侧减速修正
       setSideSpeed(TRACK_SPEED + 40, TRACK_SLOW_SPEED);
-      if (waitWithEmergencyStop(50)) { restoreSpeed(); return; }
+      delay(50);
       driveBackwardSilent();
     } else {
       // 两后端都在白色区域：车尾居中 → 全速后退
       setSideSpeed(TRACK_SPEED, TRACK_SPEED);
-      if (waitWithEmergencyStop(50)) { restoreSpeed(); return; }
+      delay(50);
       driveBackwardSilent();
     }
     delay(5);
