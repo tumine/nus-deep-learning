@@ -82,6 +82,8 @@ void setup() {
   Serial.println("  TB - Track backward until intersection");
   Serial.println("  CL/CR - Follow 90-deg corner, turn left/right");
   Serial.println("  PL/PR - Pivot 90-deg left/right at intersection");
+  Serial.println("  PU - Pivot 180-deg (U-turn) on the line");
+  Serial.println("  TO - Track forward until obstacle, then send 'D:<dist>'");
   Serial.println("  (After tracking completes, 'Done' is sent)");
   Serial.print("Current angle scale (fixed): ");
   Serial.println(angleScale);
@@ -144,10 +146,12 @@ void loop() {
     // ---------- 循迹类多字符命令（必须先于单字符解析，避免 "TF" 被 'T' 吞掉） ----------
     if (command == "TF")      { trackForward();     return; }
     else if (command == "TB") { trackBackward();    return; }
+    else if (command == "TO") { trackForwardUntilObstacle(); return; }
     else if (command == "CL") { cornerTurn(true);   return; }
     else if (command == "CR") { cornerTurn(false);  return; }
     else if (command == "PL") { pivotLeft();        return; }
     else if (command == "PR") { pivotRight();       return; }
+    else if (command == "PU") { pivotUTurn();       return; }
 
     char cmd = command.charAt(0);
     String param = command.substring(1);
@@ -668,6 +672,70 @@ void pivotLeft() {
 }
 
 // ==========================================================
+// TO：循迹直行（前进），直到超声波检测到障碍物（参考 O 命令）
+// 方向修正逻辑与 TF 相同（前端 0/1 号传感器），
+// 但不在交叉口停车，而是持续循迹直到前方出现障碍物。
+// 停车后通过编码器计算行驶距离，发送 "D:<distance>"。
+// ==========================================================
+void trackForwardUntilObstacle() {
+  unsigned long start = millis();
+
+  // 开始前清零编码器（与 O 命令一致）
+  noInterrupts();
+  encoderCountLeft = 0;
+  encoderCountRight = 0;
+  interrupts();
+
+  while (true) {
+    if (checkEmergencyStop()) { restoreSpeed(); return; }
+    if (millis() - start > TRACK_TIMEOUT) { trackFinish("Timeout"); return; }
+
+    // 【障碍物判定】与 O 命令相同的距离阈值
+    float cm = measureDistance();
+    if (cm > 0 && cm < OBSTACLE_DIST) {
+      stopSilent();
+      restoreSpeed();
+
+      // 计算走过的距离并回传（格式如: D:45.5）
+      noInterrupts();
+      long left = abs(encoderCountLeft);
+      long right = abs(encoderCountRight);
+      interrupts();
+      long avgPulses = (left + right) / 2;
+      float traveled_cm = avgPulses * CM_PER_PULSE;
+
+      Serial.print("D:");
+      Serial.println(traveled_cm);
+      Serial.println("Done");
+      return;
+    }
+
+    bool fl = onLine(TRACK_PIN_FL);  // 左前
+    bool fr = onLine(TRACK_PIN_FR);  // 右前
+
+    // 【方向修正】与 TF 相同，但交叉口横线不停车，直接穿过
+    if (fl && fr) {
+      // 两前端同时压黑：碰到路口横线 → 直行穿过
+      setSideSpeed(TRACK_SPEED, TRACK_SPEED);
+      driveForwardSilent();
+    } else if (fl) {
+      // 仅左前压黑：黑线偏向车体左侧 → 左侧减速向左修正
+      setSideSpeed(TRACK_SLOW_SPEED, TRACK_SPEED + 60);
+      driveForwardSilent();
+    } else if (fr) {
+      // 仅右前压黑：黑线偏向车体右侧 → 右侧减速向右修正
+      setSideSpeed(TRACK_SPEED + 60, TRACK_SLOW_SPEED);
+      driveForwardSilent();
+    } else {
+      // 两前端都在白色区域：车体居中 → 全速直行
+      setSideSpeed(TRACK_SPEED, TRACK_SPEED);
+      driveForwardSilent();
+    }
+    delay(5);
+  }
+}
+
+// ==========================================================
 // PR：交叉路口原地右旋 90 度
 // 场景：车体中心已停在标准十字路口中央（通常由 TF/TB 停下）
 // 以右前传感器（1号）为基准：
@@ -694,6 +762,46 @@ void pivotRight() {
     if (checkEmergencyStop()) { restoreSpeed(); return; }
     if (millis() - start > TRACK_TIMEOUT) { trackFinish("Timeout"); return; }
     delay(2);
+  }
+
+  trackFinish("Done");
+}
+
+// ==========================================================
+// PU：循迹原地旋转 180 度（掉头）
+// 场景：车体中心停在标准十字路口中央（通常由 TF/TB 停下），
+//       与 PL/PR 使用场景一致。
+// 以左前传感器（0号）为基准，向左连续执行两段 90 度扫线
+// （每段 = 离开黑线 → 再次压到黑线，与 PL 单段逻辑相同）：
+//   第1段：离开原黑线 → 扫到垂直方向黑线（旋转约90度）
+//   第2段：离开垂直黑线 → 扫到原黑线反向延长线（再旋转约90度）
+// 每段均有最小旋转时间约束，避免误触发。
+// 注意：若在无交叉线的直线段使用，传感器每约180度才扫线一次，
+//       两段逻辑会旋转过头，请仅在十字路口使用本命令。
+// ==========================================================
+void pivotUTurn() {
+  unsigned long start = millis();
+  setSideSpeed(TRACK_TURN_SPEED, TRACK_TURN_SPEED);
+
+  rotateLeftSilent();
+
+  // 连续执行两段 90 度扫线（离线→压线），共 180 度
+  for (int seg = 0; seg < 2; seg++) {
+    unsigned long segStart = millis();
+
+    // ---- 阶段1：等待左前传感器离开黑线，进入白区（LOW）----
+    while (onLine(TRACK_PIN_FL) || millis() - segStart < TRACK_TURN_MINTIME1) {
+      if (checkEmergencyStop()) { restoreSpeed(); return; }
+      if (millis() - start > TRACK_TIMEOUT) { trackFinish("Timeout"); return; }
+      delay(2);
+    }
+
+    // ---- 阶段2：继续左旋，直到左前传感器再次压到黑线（HIGH）----
+    while (!onLine(TRACK_PIN_FL) || millis() - segStart < TRACK_TURN_MINTIME2) {
+      if (checkEmergencyStop()) { restoreSpeed(); return; }
+      if (millis() - start > TRACK_TIMEOUT) { trackFinish("Timeout"); return; }
+      delay(2);
+    }
   }
 
   trackFinish("Done");
