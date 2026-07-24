@@ -27,6 +27,7 @@ const int OBSTACLE_DIST = 30;        // 障碍物距离阈值（cm）
 const unsigned long OBSTACLE_CHECK_INTERVAL = 60; // 障碍物检测最小间隔（ms），限频避免阻塞
 unsigned long lastObstacleCheck = 0;              // 上次障碍物检测时刻
 bool manualMoving = false;                        // 手动命令(F/B/L/R)运动中标志
+bool manualForward = false;                       // 手动运动是否为前进（仅前进受障碍守护）
 
 // 编码器校准（请根据实际硬件修改）
 const float CM_PER_PULSE = 20.0 / 4.0; // 每个脉冲对应 5.0 cm
@@ -74,6 +75,8 @@ bool checkEmergencyStop() {
 }
 
 // ---------- 全局障碍物守护：限频测距，30cm 内立即停车 ----------
+// 注意：守护仅对前进类运动生效（F / G正值 / TF），
+// 后退与转向不受影响，否则障碍物仍在 30cm 内时小车无法脱困。
 // 返回 true 表示已因障碍物停车，调用方应中止当前动作
 bool checkObstacle() {
   unsigned long now = millis();
@@ -114,7 +117,7 @@ void setup() {
   Serial.println("  PN - Pivot 180-deg (U-turn) on the line");
   Serial.println("  TO - Track forward until obstacle, then send 'D:<dist>'");
   Serial.println("  (After tracking completes, 'Done' is sent)");
-  Serial.println("  Ultrasonic guard: auto-stop when obstacle < 30cm ('Obstacle Stop')");
+  Serial.println("  Ultrasonic guard: forward motion auto-stops when obstacle < 30cm ('Obstacle Stop')");
   Serial.print("Current angle scale (fixed): ");
   Serial.println(angleScale);
 
@@ -168,8 +171,8 @@ void loop() {
   }
   lastButtonState = reading;
 
-  // --- 全局障碍物守护：手动命令(F/B/L/R)运动期间持续检测 ---
-  if (manualMoving) {
+  // --- 全局障碍物守护：仅手动前进(F)期间持续检测，后退/转向不受限以便脱困 ---
+  if (manualMoving && manualForward) {
     checkObstacle();  // 触发时内部会 stopAllMotors() 并清除 manualMoving
   }
 
@@ -264,13 +267,15 @@ void moveDistance(float dist_cm) {
   long needed = abs(targetPulses);
   long avgPulses = 0;
 
-  if (targetPulses > 0) forward(); else backward();
+  bool movingForward = (targetPulses > 0);
+  if (movingForward) forward(); else backward();
 
   unsigned long start = millis();
   unsigned long lastPrintTime = start;   // 用于控制打印频率
 
   while (avgPulses < needed) {
-    if (checkStopConditions()) {
+    // 障碍守护仅对前进生效；后退只响应急停命令
+    if (movingForward ? checkStopConditions() : checkEmergencyStop()) {
         return;
     }
     
@@ -349,7 +354,8 @@ void turnAngle(float angle_deg) {
 
   while (avgPulses < needed) {
 
-    if (checkStopConditions()) {
+    // 原地旋转不受障碍守护限制（否则障碍物前无法转向脱困）
+    if (checkEmergencyStop()) {
         return;
     }
 
@@ -451,6 +457,7 @@ void forward() {
   motor3.run(FORWARD);
   motor4.run(FORWARD);
   manualMoving = true;
+  manualForward = true;
   Serial.println("Forward");
 }
 
@@ -460,6 +467,7 @@ void backward() {
   motor3.run(BACKWARD);
   motor4.run(BACKWARD);
   manualMoving = true;
+  manualForward = false;
   Serial.println("Backward");
 }
 
@@ -469,6 +477,7 @@ void turnLeft() {
   motor3.run(FORWARD);
   motor4.run(BACKWARD);
   manualMoving = true;
+  manualForward = false;
   Serial.println("Turn Left");
 }
 
@@ -478,6 +487,7 @@ void turnRight() {
   motor3.run(BACKWARD);
   motor4.run(FORWARD);
   manualMoving = true;
+  manualForward = false;
   Serial.println("Turn Right");
 }
 
@@ -487,6 +497,7 @@ void stopAllMotors() {
   motor3.run(RELEASE);
   motor4.run(RELEASE);
   manualMoving = false;
+  manualForward = false;
   Serial.println("Stopped");
 }
 
@@ -640,7 +651,8 @@ void trackBackward(int nStop) {
   int crossCount = 0;
 
   while (true) {
-    if (checkStopConditions()) { restoreSpeed(); return; }
+    // 倒车不受障碍守护限制（超声波朝前，且需允许退离障碍）
+    if (checkEmergencyStop()) { restoreSpeed(); return; }
     if (millis() - start > TRACK_TIMEOUT) { trackFinish("Timeout"); return; }
 
     bool rl = onLine(TRACK_PIN_RL);  // 左后
@@ -659,7 +671,7 @@ void trackBackward(int nStop) {
       setSideSpeed(TRACK_SPEED, TRACK_SPEED);
       driveBackwardSilent();
       while (onLine(TRACK_PIN_ML) || onLine(TRACK_PIN_MR)) {
-        if (checkStopConditions()) { restoreSpeed(); return; }
+        if (checkEmergencyStop()) { restoreSpeed(); return; }
         if (millis() - start > TRACK_TIMEOUT) { trackFinish("Timeout"); return; }
         delay(2);
       }
@@ -712,16 +724,17 @@ void cornerTurn(bool leftTurn) {
   if (leftTurn) rotateLeftSilent();
   else          rotateRightSilent();
 
+  // 转向过程不受障碍守护限制（需允许在障碍物前转向脱困）
   // ---- 阶段1：等待前端离开当前黑线（两前端均为白 LOW）----
   while (onLine(TRACK_PIN_FL) || onLine(TRACK_PIN_FR)) {
-    if (checkStopConditions()) { restoreSpeed(); return; }
+    if (checkEmergencyStop()) { restoreSpeed(); return; }
     if (millis() - start > TRACK_TIMEOUT) { trackFinish("Timeout"); return; }
     delay(2);
   }
 
   // ---- 阶段2：继续旋转，直到内侧前端重新压到新方向黑线（HIGH）----
   while (!onLine(innerFrontPin)) {
-    if (checkStopConditions()) { restoreSpeed(); return; }
+    if (checkEmergencyStop()) { restoreSpeed(); return; }
     if (millis() - start > TRACK_TIMEOUT) { trackFinish("Timeout"); return; }
     delay(2);
   }
@@ -729,7 +742,7 @@ void cornerTurn(bool leftTurn) {
   // ---- 阶段3：继续旋转少许，让内侧传感器越过黑线回到白区，
   //             黑线即落在两前端传感器之间，车头对准新方向 ----
   while (onLine(innerFrontPin)) {
-    if (checkStopConditions()) { restoreSpeed(); return; }
+    if (checkEmergencyStop()) { restoreSpeed(); return; }
     if (millis() - start > TRACK_TIMEOUT) { trackFinish("Timeout"); return; }
     delay(2);
   }
@@ -751,9 +764,10 @@ void pivotLeft() {
 
   rotateLeftSilent();
 
+  // 原地旋转不受障碍守护限制
   // ---- 阶段1：等待左前传感器离开黑线，进入白区（LOW）----
   while (onLine(TRACK_PIN_FL) || millis() - start < TRACK_TURN_MINTIME1) {
-    if (checkStopConditions()) { restoreSpeed(); return; }
+    if (checkEmergencyStop()) { restoreSpeed(); return; }
     if (millis() - start > TRACK_TIMEOUT) { trackFinish("Timeout"); return; }
     delay(2);
   }
@@ -761,7 +775,7 @@ void pivotLeft() {
   // ---- 阶段2：继续左旋，直到左前传感器再次压到黑线（HIGH），
   //             即检测到新方向的黑线 → 停车 ----
   while (!onLine(TRACK_PIN_FL) || millis() - start < TRACK_TURN_MINTIME2) {
-    if (checkStopConditions()) { restoreSpeed(); return; }
+    if (checkEmergencyStop()) { restoreSpeed(); return; }
     if (millis() - start > TRACK_TIMEOUT) { trackFinish("Timeout"); return; }
     delay(2);
   }
@@ -847,9 +861,10 @@ void pivotRight() {
 
   rotateRightSilent();
 
+  // 原地旋转不受障碍守护限制
   // ---- 阶段1：等待右前传感器离开黑线，进入白区（LOW）----
   while (onLine(TRACK_PIN_FR) || millis() - start < TRACK_TURN_MINTIME1) {
-    if (checkStopConditions()) { restoreSpeed(); return; }
+    if (checkEmergencyStop()) { restoreSpeed(); return; }
     if (millis() - start > TRACK_TIMEOUT) { trackFinish("Timeout"); return; }
     delay(2);
   }
@@ -857,7 +872,7 @@ void pivotRight() {
   // ---- 阶段2：继续右旋，直到右前传感器再次压到黑线（HIGH），
   //             即检测到新方向的黑线 → 停车 ----
   while (!onLine(TRACK_PIN_FR) || millis() - start < TRACK_TURN_MINTIME2) {
-    if (checkStopConditions()) { restoreSpeed(); return; }
+    if (checkEmergencyStop()) { restoreSpeed(); return; }
     if (millis() - start > TRACK_TIMEOUT) { trackFinish("Timeout"); return; }
     delay(2);
   }
@@ -887,16 +902,17 @@ void pivotUTurn() {
   for (int seg = 0; seg < 2; seg++) {
     unsigned long segStart = millis();
 
+    // 原地旋转不受障碍守护限制
     // ---- 阶段1：等待左前传感器离开黑线，进入白区（LOW）----
     while (onLine(TRACK_PIN_FL) || millis() - segStart < TRACK_TURN_MINTIME1) {
-      if (checkStopConditions()) { restoreSpeed(); return; }
+      if (checkEmergencyStop()) { restoreSpeed(); return; }
       if (millis() - start > TRACK_TIMEOUT) { trackFinish("Timeout"); return; }
       delay(2);
     }
 
     // ---- 阶段2：继续左旋，直到左前传感器再次压到黑线（HIGH）----
     while (!onLine(TRACK_PIN_FL) || millis() - segStart < TRACK_TURN_MINTIME2) {
-      if (checkStopConditions()) { restoreSpeed(); return; }
+      if (checkEmergencyStop()) { restoreSpeed(); return; }
       if (millis() - start > TRACK_TIMEOUT) { trackFinish("Timeout"); return; }
       delay(2);
     }

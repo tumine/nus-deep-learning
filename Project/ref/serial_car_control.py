@@ -70,6 +70,7 @@ class CarSerial:
     REPLY_TURN_RIGHT     = "Turn Right"
     REPLY_INVALID_CMD    = "Unknown command"
     REPLY_TIMEOUT        = "Timeout"
+    REPLY_OBSTACLE_STOP  = "Obstacle Stop"   # 超声波守护触发，动作被中断
 
     DEFAULT_BAUDRATE     = 9600
     DEFAULT_TIMEOUT      = 1.0
@@ -184,8 +185,11 @@ class CarSerial:
             time.sleep(0.5)
             print(f"  [模拟] 移动 {dist_cm} cm 完成")
             return True
-        reply = self._wait_for(lambda l: l in (self.REPLY_DONE, self.REPLY_TIMEOUT),
+        reply = self._wait_for(lambda l: l in (self.REPLY_DONE, self.REPLY_TIMEOUT,
+                                               self.REPLY_OBSTACLE_STOP),
                                self.MOVE_TIMEOUT, desc="G 命令完成")
+        if reply == self.REPLY_OBSTACLE_STOP:
+            print("  [障碍] 前方 30cm 内检测到障碍物，动作已中断")
         return reply == self.REPLY_DONE
 
     def turn_angle(self, angle_deg: float):
@@ -201,8 +205,11 @@ class CarSerial:
             time.sleep(0.5)
             print(f"  [模拟] 旋转 {angle_deg}° 完成")
             return True
-        reply = self._wait_for(lambda l: l in (self.REPLY_DONE, self.REPLY_TIMEOUT),
+        reply = self._wait_for(lambda l: l in (self.REPLY_DONE, self.REPLY_TIMEOUT,
+                                               self.REPLY_OBSTACLE_STOP),
                                self.MOVE_TIMEOUT, desc="T 命令完成")
+        if reply == self.REPLY_OBSTACLE_STOP:
+            print("  [障碍] 前方 30cm 内检测到障碍物，动作已中断")
         return reply == self.REPLY_DONE
 
     # ------------------------------------------------------------------
@@ -233,14 +240,17 @@ class CarSerial:
     # 循迹命令（HW-511，等待 Done）
     # ------------------------------------------------------------------
     def _track_command(self, cmd: str, desc: str) -> bool:
-        """发送循迹命令并阻塞等待 Done / Timeout，返回是否成功"""
+        """发送循迹命令并阻塞等待 Done / Timeout / Obstacle Stop，返回是否成功"""
         self._write(cmd)
         if self.simulation_mode:
             time.sleep(0.5)
             print(f"  [模拟] {desc} 完成")
             return True
-        reply = self._wait_for(lambda l: l in (self.REPLY_DONE, self.REPLY_TIMEOUT),
+        reply = self._wait_for(lambda l: l in (self.REPLY_DONE, self.REPLY_TIMEOUT,
+                                               self.REPLY_OBSTACLE_STOP),
                                self.TRACK_TIMEOUT, desc=desc)
+        if reply == self.REPLY_OBSTACLE_STOP:
+            print(f"  [障碍] 前方 30cm 内检测到障碍物，{desc} 已中断")
         return reply == self.REPLY_DONE
 
     def track_forward(self, n: int = 1) -> bool:
