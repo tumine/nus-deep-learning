@@ -1,3 +1,4 @@
+from intent_parser import parse_request
 from flask import Flask, render_template, request
 import os
 import whisper
@@ -34,11 +35,15 @@ def upload_audio():
 
     text = result["text"]
 
+    request_message = parse_request(text)
+
     print("Speech:", text)
+    print("Request:", request_message)
 
     return {
         "status": "success",
-        "text": text
+        "text": text,
+        "request": request_message
     }
 
 if __name__ == "__main__":
