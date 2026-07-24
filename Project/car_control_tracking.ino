@@ -512,7 +512,10 @@ void trackForward() {
     // 【交叉口判定】中部左右两个传感器同时压黑：
     // 说明横向黑线已经到达车身中部，车体中心位于路口中央 → 停车
     if (ml && mr) {
-      delay(80);  // 【关键数据】补偿运动的时间
+      // 【关键数据】补偿运动的时间
+      delay(60);  // 满电量时数据
+      // delay(80);  // 中等电量时数据
+      // 低电量时数据（待测）
       trackFinish("Done");
       return;
     }
@@ -524,11 +527,11 @@ void trackForward() {
       driveForwardSilent();
     } else if (fl) {
       // 仅左前压黑（HIGH）：黑线偏向车体左侧 → 左侧减速向左修正
-      setSideSpeed(TRACK_SLOW_SPEED, TRACK_SPEED);
+      setSideSpeed(TRACK_SLOW_SPEED, TRACK_SPEED + 60);
       driveForwardSilent();
     } else if (fr) {
       // 仅右前压黑：黑线偏向车体右侧 → 右侧减速向右修正
-      setSideSpeed(TRACK_SPEED, TRACK_SLOW_SPEED);
+      setSideSpeed(TRACK_SPEED + 60, TRACK_SLOW_SPEED);
       driveForwardSilent();
     } else {
       // 两前端都在白色区域：车体居中 → 全速直行
