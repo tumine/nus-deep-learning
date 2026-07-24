@@ -70,12 +70,12 @@ document
 
         document
         .getElementById("status")
-        .innerText =
-            "Recognized Speech: " + data.text;
+        .innerText = 
+            "Speech: " + data.text +
+            "\nRequest: " + data.request;
     };
 
     mediaRecorder.start();
-
     document
     .getElementById("status")
     .innerText =
