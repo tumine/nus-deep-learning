@@ -1,0 +1,94 @@
+<!DOCTYPE html>
+<html>
+
+<head>
+    <title>Robot Speech Demo</title>
+</head>
+
+<body>
+
+<h1>Robot Speech Demo</h1>
+
+<button id="recordBtn">
+    Start Recording
+</button>
+
+<p id="status">
+    Ready
+</p>
+
+<script>
+
+let mediaRecorder;
+let audioChunks = [];
+
+document
+.getElementById("recordBtn")
+.onclick = async () => {
+
+    const stream =
+        await navigator
+        .mediaDevices
+        .getUserMedia({ audio: true });
+
+    mediaRecorder =
+        new MediaRecorder(stream);
+
+    audioChunks = [];
+
+    mediaRecorder.ondataavailable =
+        event => {
+            audioChunks.push(event.data);
+        };
+
+    mediaRecorder.onstop = async () => {
+
+        const audioBlob =
+            new Blob(
+                audioChunks,
+                { type: "audio/webm" }
+            );
+
+        const formData =
+            new FormData();
+
+        formData.append(
+            "audio",
+            audioBlob,
+            "audio.webm"
+        );
+
+        const response = await fetch(
+            "/upload_audio",
+            {
+                method: "POST",
+                body: formData
+            }
+        );
+
+        const data = await response.json();
+
+        document
+        .getElementById("status")
+        .innerText = 
+            "Speech: " + data.text +
+            "\nRequest: " + data.request;
+    };
+
+    mediaRecorder.start();
+    document
+    .getElementById("status")
+    .innerText =
+        "Recording...";
+
+    setTimeout(() => {
+
+        mediaRecorder.stop();
+
+    }, 3000);
+};
+
+</script>
+
+</body>
+</html>

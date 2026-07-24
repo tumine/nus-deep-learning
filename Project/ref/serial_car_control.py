@@ -14,6 +14,14 @@ serial_car_control.py
     T <angle> - 旋转指定角度（度），正=左转，负=右转，完成后返回 "Done"
     RST       - 重置编码器计数
 
+循迹命令（HW-511 模块，完成后均返回 "Done"）:
+    TF [n]    - 循迹前进，直到到达连续第 n 个交叉路口中央（默认 1）
+    TB [n]    - 循迹倒车，直到退至连续第 n 个交叉路口中央（默认 1）
+    TO        - 循迹前进直到检测到障碍物，返回行驶距离（cm，格式 D:<dist>）
+    CL / CR   - 直角弯道沿黑线左转 / 右转 90 度
+    PL / PR   - 交叉路口原地左旋 / 右旋 90 度
+    PU        - 交叉路口原地旋转 180 度（掉头）
+
 用法:
     python serial_car_control.py          # 交互模式
     或:
@@ -67,6 +75,7 @@ class CarSerial:
     DEFAULT_TIMEOUT      = 1.0
     MOVE_TIMEOUT         = 35.0          # G / T 命令最长等待时间（s）
     OBSTACLE_TIMEOUT     = 60.0          # O 命令最长等待时间（s）
+    TRACK_TIMEOUT        = 35.0          # 循迹命令最长等待时间（s，Arduino 端 30s 超时 + 余量）
 
     def __init__(self, baudrate=None, port=None, simulation_mode=False):
         """
@@ -221,6 +230,82 @@ class CarSerial:
         return None
 
     # ------------------------------------------------------------------
+    # 循迹命令（HW-511，等待 Done）
+    # ------------------------------------------------------------------
+    def _track_command(self, cmd: str, desc: str) -> bool:
+        """发送循迹命令并阻塞等待 Done / Timeout，返回是否成功"""
+        self._write(cmd)
+        if self.simulation_mode:
+            time.sleep(0.5)
+            print(f"  [模拟] {desc} 完成")
+            return True
+        reply = self._wait_for(lambda l: l in (self.REPLY_DONE, self.REPLY_TIMEOUT),
+                               self.TRACK_TIMEOUT, desc=desc)
+        return reply == self.REPLY_DONE
+
+    def track_forward(self, n: int = 1) -> bool:
+        """循迹前进至连续第 n 个交叉路口中央（TF [n] 命令，默认 1），返回 True 表示成功"""
+        if n < 1:
+            print(f"  [错误] 路口数必须 >= 1: {n}")
+            return False
+        cmd = "TF" if n == 1 else f"TF {n}"
+        return self._track_command(cmd, f"循迹前进至第{n}个路口")
+
+    def track_backward(self, n: int = 1) -> bool:
+        """循迹倒车至连续第 n 个交叉路口中央（TB [n] 命令，默认 1），返回 True 表示成功"""
+        if n < 1:
+            print(f"  [错误] 路口数必须 >= 1: {n}")
+            return False
+        cmd = "TB" if n == 1 else f"TB {n}"
+        return self._track_command(cmd, f"循迹倒车至第{n}个路口")
+
+    def corner_left(self) -> bool:
+        """直角弯道沿黑线左转 90 度（CL 命令）"""
+        return self._track_command("CL", "弯道左转")
+
+    def corner_right(self) -> bool:
+        """直角弯道沿黑线右转 90 度（CR 命令）"""
+        return self._track_command("CR", "弯道右转")
+
+    def pivot_left(self) -> bool:
+        """交叉路口原地左旋 90 度（PL 命令）"""
+        return self._track_command("PL", "路口左旋")
+
+    def pivot_right(self) -> bool:
+        """交叉路口原地右旋 90 度（PR 命令）"""
+        return self._track_command("PR", "路口右旋")
+
+    def pivot_u_turn_intersection(self) -> bool:
+        """交叉路口原地旋转 180 度掉头（PU 命令）"""
+        return self._track_command("PU", "路口掉头180度")
+
+    def pivot_u_turn_line(self) -> bool:
+        """直线原地左旋 180 度掉头（PN 命令）"""
+        return self._track_command("PN", "直线掉头180度")
+
+    def track_until_obstacle(self) -> float | None:
+        """
+        循迹前进直到检测到障碍物（TO 命令）。
+        返回行驶距离（cm），超时返回 None
+        """
+        self._write("TO")
+        if self.simulation_mode:
+            time.sleep(0.5)
+            mock_dist = 45.0
+            print(f"  [模拟] 循迹检测到障碍物，行驶距离 {mock_dist} cm")
+            return mock_dist
+
+        reply = self._wait_for(lambda l: l.startswith(self.REPLY_DISTANCE)
+                               or l == self.REPLY_TIMEOUT,
+                               self.TRACK_TIMEOUT, desc="循迹障碍物距离")
+        if reply and reply.startswith(self.REPLY_DISTANCE):
+            try:
+                return float(reply.split(":")[1])
+            except (IndexError, ValueError):
+                return None
+        return None
+
+    # ------------------------------------------------------------------
     # 编码器重置
     # ------------------------------------------------------------------
     def reset_encoders(self):
@@ -258,6 +343,14 @@ def interactive():
     print("    T <角度deg>    - 旋转指定角度（负数为右转）")
     print("    O              - 前进直到检测到障碍物")
     print("    RST            - 重置编码器")
+    print("    --- 循迹命令 (HW-511) ---")
+    print("    TF [n]         - 循迹前进至连续第 n 个交叉路口（默认 1）")
+    print("    TB [n]         - 循迹倒车至连续第 n 个交叉路口（默认 1）")
+    print("    TO             - 循迹前进直到检测到障碍物")
+    print("    CL / CR        - 直角弯道左转 / 右转")
+    print("    PL / PR        - 路口原地左旋 / 右旋 90度")
+    print("    PU             - 路口原地旋转 180度 掉头")
+    print("    PN             - 直线原地旋转 180度 掉头")
     print("    quit / q       - 退出")
     print("=" * 50)
 
@@ -275,6 +368,34 @@ def interactive():
             upper = raw.upper()
             if upper in ('QUIT', 'Q', 'EXIT'):
                 break
+            # --- 循迹命令（必须先于单字符 T 解析，避免 TF/TB/TO 被当作 T 角度命令）---
+            elif upper in ('TF', 'TB') or upper.startswith(('TF ', 'TB ')):
+                param = raw[2:].strip()
+                try:
+                    n = int(param) if param else 1
+                except ValueError:
+                    print("  → 用法: TF   或   TF 3")
+                    continue
+                action = car.track_forward if upper.startswith('TF') else car.track_backward
+                ok = action(n)
+                print(f"  → {'成功' if ok else '失败/超时'}")
+            elif upper in ('CL', 'CR', 'PL', 'PR', 'PU', 'PN'):
+                actions = {
+                    'CL': car.corner_left,
+                    'CR': car.corner_right,
+                    'PL': car.pivot_left,
+                    'PR': car.pivot_right,
+                    'PU': car.pivot_u_turn_intersection,
+                    'PN': car.pivot_u_turn_line,
+                }
+                ok = actions[upper]()
+                print(f"  → {'成功' if ok else '失败/超时'}")
+            elif upper == 'TO':
+                dist = car.track_until_obstacle()
+                if dist is not None:
+                    print(f"  → 循迹行驶距离: {dist:.1f} cm")
+                else:
+                    print("  → 探测超时")
             elif upper == 'F':
                 car.go_forward()
             elif upper == 'B':
