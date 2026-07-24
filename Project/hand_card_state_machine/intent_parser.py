@@ -7,7 +7,13 @@ def parse_request(text):
     if "help" in text:
         return "Teacher's help"
 
-    if "more" in text:
-        return "Need one more _____"
+    if "pencil" in text:
+        return "Need a pencil"
+
+    if "eraser" in text or "rubber" in text:
+        return "Need an eraser"
+
+    if "block" in text or "blocks" in text:
+        return "Need a block"
 
     return "Unknown request"
