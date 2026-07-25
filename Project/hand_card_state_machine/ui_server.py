@@ -46,6 +46,7 @@ th{background:#f8fafc;position:sticky;top:0}.table-wrap{max-height:470px;overflo
 .actions{display:grid;gap:12px}
 button{border:0;border-radius:11px;padding:14px;font-weight:700;cursor:pointer;font-size:.95rem}
 .stop{background:#dc2626;color:white}.stop:hover{background:#b91c1c}
+.audio{background:#7c3aed;color:white}.audio:hover:not(:disabled){background:#6d28d9}
 .load{background:#2563eb;color:white}.load:hover:not(:disabled){background:#1d4ed8}
 .unload{background:#16a34a;color:white}.unload:hover:not(:disabled){background:#15803d}
 button:disabled{background:#cbd5e1;color:#64748b;cursor:not-allowed;opacity:.72}
@@ -82,6 +83,14 @@ button:disabled{background:#cbd5e1;color:#64748b;cursor:not-allowed;opacity:.72}
       <div class="card">
         <h2>🎛 Control</h2>
         <div class="actions">
+          <button
+            class="audio"
+            id="audioEnableButton"
+            onclick="enablePhoneAudio()"
+          >
+            🔊 Enable Phone Audio
+          </button>
+
           <button class="stop" onclick="sendCommand('STOP')">
             🛑 EMERGENCY STOP
           </button>
@@ -117,6 +126,8 @@ button:disabled{background:#cbd5e1;color:#64748b;cursor:not-allowed;opacity:.72}
 <script>
 let socket = null;
 let requests = [];
+let phoneAudioEnabled = false;
+let audioContext = null;
 
 function log(text){
   const box=document.getElementById("eventLog");
@@ -162,6 +173,25 @@ function reportAudioPlayback(requestId, played){
       request_id:requestId,
       played
     }));
+  }
+}
+function enablePhoneAudio(){
+  const button=document.getElementById("audioEnableButton");
+  try{
+    const AudioContextClass=window.AudioContext||window.webkitAudioContext;
+    if(AudioContextClass){
+      audioContext=audioContext||new AudioContextClass();
+      audioContext.resume();
+    }
+    phoneAudioEnabled=true;
+    button.disabled=true;
+    button.textContent="Phone Audio Enabled";
+    log("Phone audio enabled.");
+    if(socket&&socket.readyState===WebSocket.OPEN){
+      socket.send(JSON.stringify({type:"enable_audio"}));
+    }
+  }catch(error){
+    log("Unable to enable phone audio.");
   }
 }
 function playBrowserAudio(data){
@@ -218,8 +248,13 @@ function handleMessage(message){
   }else if(type==="audio_playback"){
     log(data.message||"Audio playback update.");
   }else if(type==="play_audio"){
-    log("Starting browser audio playback.");
-    playBrowserAudio(data);
+    if(phoneAudioEnabled){
+      log("Starting browser audio playback.");
+      playBrowserAudio(data);
+    }else{
+      reportAudioPlayback(data.request_id,false);
+      log("Audio playback ignored until phone audio is enabled.");
+    }
   }
 }
 function connect(){
@@ -228,6 +263,9 @@ function connect(){
   socket.onopen=()=>{
     const n=document.getElementById("wsStatus");
     n.textContent="● WebSocket connected";n.className="online";log("WebSocket connected.");
+    if(phoneAudioEnabled){
+      socket.send(JSON.stringify({type:"enable_audio"}));
+    }
   };
   socket.onmessage=e=>{try{handleMessage(JSON.parse(e.data));}catch(err){log("Invalid server message.");}};
   socket.onclose=()=>{
@@ -280,6 +318,7 @@ class UIServer:
         self.open_browser = open_browser
         self.app = FastAPI()
         self.active_connections: list[WebSocket] = []
+        self.audio_enabled_connections: list[WebSocket] = []
         self._audio_playback_waiters: dict[str, asyncio.Future[bool]] = {}
         self._register_routes()
 
@@ -290,20 +329,40 @@ class UIServer:
 
         @self.app.post("/api/audio")
         async def play_audio(audio_payload: dict[str, Any]) -> dict[str, bool]:
-            if not self.active_connections:
-                raise HTTPException(status_code=503, detail="No browser is connected for audio playback.")
+            audio_connection: WebSocket | None = None
+            for connection in reversed(self.audio_enabled_connections):
+                if connection in self.active_connections:
+                    audio_connection = connection
+                    break
+
+            if audio_connection is None:
+                raise HTTPException(
+                    status_code=503,
+                    detail="No browser has enabled phone audio playback.",
+                )
 
             request_id = str(uuid.uuid4())
             completion = asyncio.get_running_loop().create_future()
             self._audio_playback_waiters[request_id] = completion
-            self.ui_manager.publish(
-                "play_audio",
-                {
-                    "request_id": request_id,
-                    "audio_base64": str(audio_payload.get("audio_base64", "")),
-                    "media_type": str(audio_payload.get("media_type", "audio/mp4")),
-                },
-            )
+            try:
+                await audio_connection.send_json(
+                    {
+                        "type": "play_audio",
+                        "data": {
+                            "request_id": request_id,
+                            "audio_base64": str(audio_payload.get("audio_base64", "")),
+                            "media_type": str(audio_payload.get("media_type", "audio/mp4")),
+                        },
+                    }
+                )
+            except Exception as error:
+                self._audio_playback_waiters.pop(request_id, None)
+                if audio_connection in self.audio_enabled_connections:
+                    self.audio_enabled_connections.remove(audio_connection)
+                raise HTTPException(
+                    status_code=503,
+                    detail="Phone audio connection is unavailable.",
+                ) from error
 
             try:
                 played = await asyncio.wait_for(completion, timeout=15.0)
@@ -338,6 +397,9 @@ class UIServer:
                         command = str(message.get("command", "")).upper()
                         if command:
                             self.ui_manager.submit_command(command)
+                    elif message.get("type") == "enable_audio":
+                      if websocket not in self.audio_enabled_connections:
+                        self.audio_enabled_connections.append(websocket)
                     elif message.get("type") == "audio_playback_complete":
                         request_id = str(message.get("request_id", ""))
                         completion = self._audio_playback_waiters.get(request_id)
@@ -349,6 +411,8 @@ class UIServer:
             finally:
                 if websocket in self.active_connections:
                     self.active_connections.remove(websocket)
+                if websocket in self.audio_enabled_connections:
+                  self.audio_enabled_connections.remove(websocket)
 
         @self.app.on_event("startup")
         async def startup_event() -> None:
