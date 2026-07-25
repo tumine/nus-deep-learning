@@ -79,6 +79,34 @@ python Project/request_recogniser/prepare_yolo_world.py `
   --weights .\weights\yolov8s-worldv2.pt
 ```
 
+### HTTPS 下载中断
+
+`ssl.SSLEOFError: UNEXPECTED_EOF_WHILE_READING` 表示远端或中间的代理、防火墙在 TLS 连接完成前关闭了连接；它不是 CUDA、YOLO-World 类别词或模型文件的错误。脚本会以证书校验方式下载官方权重到 `zero_shot_output/checkpoints/`，并在中断时重试。
+
+企业或校园网络需要代理时，在 PowerShell 中先设置代理，再运行脚本：
+
+```powershell
+$env:HTTPS_PROXY = "http://proxy.example.com:8080"
+$env:HTTP_PROXY = $env:HTTPS_PROXY
+python Project/request_recogniser/prepare_yolo_world.py --download-retries 5
+```
+
+若 GitHub 仍不可达，请用浏览器或网络管理员提供的可信镜像下载 `yolov8s-worldv2.pt`，再使用本地文件；这种方式不触发网络下载：
+
+```powershell
+python Project/request_recogniser/prepare_yolo_world.py `
+  --weights D:\models\yolov8s-worldv2.pt
+```
+
+也可以让脚本从已确认可信的镜像下载，避免修改代码：
+
+```powershell
+python Project/request_recogniser/prepare_yolo_world.py `
+  --weights-url "https://mirror.example.com/yolov8s-worldv2.pt"
+```
+
+不要通过关闭 SSL 证书校验来规避该异常，否则无法验证下载模型的来源与完整性。
+
 ## 3. 使用未标注图片或视频检测
 
 `--source` 可以是单张图片、图片目录或视频文件。不需要任何同名 `.txt` 文件。
