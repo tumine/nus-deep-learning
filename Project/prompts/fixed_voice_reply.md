@@ -39,7 +39,7 @@
 2. Your request has been transferred to the teacher. Please wait until I fetch you the item.
 3. Your request has been transferred to the teacher. Please wait until I get the teacher here.
 4. Please press the button after you've put the item in my basket.
-5. Please claim your item from my basket, and press the button when you take it.
+5. Please claim your item from my basket, and press the button after you take it.
 
 ---
 ---

@@ -4,7 +4,7 @@ version = "0.1.0"
 requires-python = ">=3.11"
 dependencies = [
     "ultralytics>=8.0.0",
-    "opencv-python>=4.8.0",
+    "opencv-python>=4.8.0,<5.0.0",  # headless 版无 GUI 支持，不可用 opencv-python-headless
     "numpy>=1.24.0",
     "pyyaml>=6.0",
     "tqdm>=4.65.0",
@@ -16,6 +16,9 @@ dependencies = [
     "selenium>=4.15.0",
     "requests>=2.31.0",
     "pillow>=10.0.0",
+    "fastapi>=0.100.0",
+    "uvicorn>=0.23.0",
+    "cryptography>=41.0.0",  # 自签名 SSL 证书生成，用于手机 HTTPS 访问
     # PyTorch CUDA 版（GPU 训练支持）。
     # 注意：PyPI 上的 torch 是 CPU-only 版本，必须指定 PyTorch 官方 CUDA 仓库安装：
     #   pip uninstall torch torchvision torchaudio -y

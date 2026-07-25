@@ -21,7 +21,7 @@ import sys
 from camera import Camera
 from audio_dispatcher import play_audio_blocking
 from card_detector_classifier import CardDetector
-from speech_request_detector import SpeechRequestDetector
+# from speech_request_detector import SpeechRequestDetector
 from hand_detector import HandDetector
 from request_manager import RequestManager
 # from robot_controller import RobotController # 已被 TCP 网络通信替代
@@ -29,7 +29,7 @@ from state_machine import StateMachine, RobotState
 from task_queue import TaskQueue
 
 from ui_manager import UIManager
-from ui_server import UIServer
+from ui_server import UIServer, generate_self_signed_cert
 
 # ==============================================================================
 # ⚠️ 系统及网络配置区 
@@ -53,44 +53,44 @@ def print_separator():
     print("=" * 55)
 
 
-# Speech results must be converted into the same dictionary structure used by
-# RequestManager. These IDs preserve the original request mapping.
-SPEECH_REQUEST_IDS = {
-    "blocks": 0,
-    "pencil": 1,
-    "eraser": 2,
-    "teacher": 3,
-}
-
-
-def normalize_speech_event(speech_event, state_machine):
-    """
-    Convert SpeechRequestDetector output into a CardDetector-compatible event.
-
-    RequestManager currently expects:
-        result["request"], result["id"], result["center"]
-
-    A speech request has no image center, so the stored student target is used
-    when available. Otherwise, center remains None.
-    """
-    request = speech_event.get("request")
-
-    if request not in SPEECH_REQUEST_IDS:
-        print(f"[SPEECH WARNING] Unsupported request: {request}")
-        return None
-
-    student_target = state_machine.get_context_value("student_target")
-    center = student_target if isinstance(student_target, (tuple, list)) else None
-
-    return {
-        "id": SPEECH_REQUEST_IDS[request],
-        "request": request,
-        "center": center,
-        "source": "speech",
-        "text": speech_event.get("text", ""),
-        "confidence": speech_event.get("confidence", 1.0),
-        "confirmed": True,
-    }
+# # Speech results must be converted into the same dictionary structure used by
+# # RequestManager. These IDs preserve the original request mapping.
+# SPEECH_REQUEST_IDS = {
+#     "blocks": 0,
+#     "pencil": 1,
+#     "eraser": 2,
+#     "teacher": 3,
+# }
+# 
+# 
+# def normalize_speech_event(speech_event, state_machine):
+#     """
+#     Convert SpeechRequestDetector output into a CardDetector-compatible event.
+# 
+#     RequestManager currently expects:
+#         result["request"], result["id"], result["center"]
+# 
+#     A speech request has no image center, so the stored student target is used
+#     when available. Otherwise, center remains None.
+#     """
+#     request = speech_event.get("request")
+# 
+#     if request not in SPEECH_REQUEST_IDS:
+#         print(f"[SPEECH WARNING] Unsupported request: {request}")
+#         return None
+# 
+#     student_target = state_machine.get_context_value("student_target")
+#     center = student_target if isinstance(student_target, (tuple, list)) else None
+# 
+#     return {
+#         "id": SPEECH_REQUEST_IDS[request],
+#         "request": request,
+#         "center": center,
+#         "source": "speech",
+#         "text": speech_event.get("text", ""),
+#         "confidence": speech_event.get("confidence", 1.0),
+#         "confirmed": True,
+#     }
 
 
 def send_robot_command(sock, command_dict):
@@ -152,16 +152,17 @@ def handle_request_event(request_event, request_manager, task_queue, state_machi
     Both sources are normalized to the structure required by RequestManager.
     A valid event always advances WAIT_CARD -> GO_TEACHER.
     """
-    audio_id = 3 if request_event.get("request") == "teacher" else 2
-    print(f"[AUDIO] Playing request confirmation {audio_id} before teacher dispatch.")
-    try:
-        played = play_audio_blocking(audio_id)
-    except (FileNotFoundError, ValueError) as audio_error:
-        print(f"[AUDIO WARNING] {audio_error}")
-        played = False
-
-    if not played:
-        print("[AUDIO WARNING] Confirmation did not complete; continuing after audio failure/timeout.")
+    # # Speech-specific audio confirmation (disabled):
+    # audio_id = 3 if request_event.get("request") == "teacher" else 2
+    # print(f"[AUDIO] Playing request confirmation {audio_id} before teacher dispatch.")
+    # try:
+    #     played = play_audio_blocking(audio_id)
+    # except (FileNotFoundError, ValueError) as audio_error:
+    #     print(f"[AUDIO WARNING] {audio_error}")
+    #     played = False
+    # 
+    # if not played:
+    #     print("[AUDIO WARNING] Confirmation did not complete; continuing after audio failure/timeout.")
 
     task = request_manager.create_task(request_event)
     task["student_context"] = state_machine.get_context()
@@ -178,8 +179,8 @@ def handle_request_event(request_event, request_manager, task_queue, state_machi
     print(f"Request   : {request_event.get('request', 'unknown')}")
     print(f"Request ID: {request_event.get('id')}")
     print(f"Center    : {request_event.get('center')}")
-    if source == "speech":
-        print(f"Heard text: {request_event.get('text', '')}")
+    # if source == "speech":
+    #     print(f"Heard text: {request_event.get('text', '')}")
     print(f"Task      : {task}")
     print_separator()
 
@@ -244,10 +245,13 @@ def draw_system_status(frame, state_machine):
     return frame
 
 
-def tcp_receive_thread(sock, network_queue, ui_manager):
+def tcp_receive_thread(sock, network_queue, ui_manager, shutdown_event=None):
     """后台独立运行的网络接收线程，专门监听小车发回的状态信息"""
     buffer = ""
     while True:
+        # 检查是否需要退出（主线程关闭前发出信号）
+        if shutdown_event is not None and shutdown_event.is_set():
+            break
         try:
             data = sock.recv(1024).decode('utf-8')
             if not data:
@@ -264,6 +268,14 @@ def tcp_receive_thread(sock, network_queue, ui_manager):
                 if line:
                     print(f"\n📥 [网络通信] 接收到小车反馈状态: '{line}'")
                     network_queue.put(line)
+        except OSError:
+            # socket 被主线程关闭（shutdown/close）导致的异常，属于正常退出
+            if shutdown_event is not None and shutdown_event.is_set():
+                break
+            print("⚠️ [网络通信] Socket 异常关闭，连接已断开。")
+            ui_manager.update_connection("pi", False)
+            network_queue.put("connection_lost")
+            break
         except Exception as e:
             print(f"❌ [网络通信] 接收数据异常退出: {e}")
             ui_manager.update_connection("pi", False)
@@ -293,8 +305,9 @@ def main():
 
     camera = None
     tcp_socket = None
-    speech_detector = None
+    # speech_detector = None
     network_queue = queue.Queue()
+    shutdown_event = threading.Event()  # 用于通知后台线程优雅退出
 
     ui_manager = UIManager()
 
@@ -302,6 +315,7 @@ def main():
         ui_manager=ui_manager,
         host="0.0.0.0",
         port=8000,
+        ssl_certfile=None,  # 改为 generate_self_signed_cert() 的返回值以启用 HTTPS
     )
 
     ui_server.start_in_thread()
@@ -317,7 +331,7 @@ def main():
         ui_manager.update_connection("pi", True)
         
         # 启动后台接收线程
-        threading.Thread(target=tcp_receive_thread, args=(tcp_socket, network_queue, ui_manager), daemon=True).start()
+        threading.Thread(target=tcp_receive_thread, args=(tcp_socket, network_queue, ui_manager, shutdown_event), daemon=True).start()
         # === 新增：启动电脑端终端键盘输入监听线程 ===
         threading.Thread(target=pc_input_listener, args=(tcp_socket,), daemon=True).start()
 
@@ -328,7 +342,17 @@ def main():
         ui_manager.update_connection("pi", False)
 
     try:
-        camera = Camera(CAMERA_URL)
+        # Camera initialization with network fallback
+        try:
+            print(f"[CAMERA] 正在连接摄像头流: {CAMERA_URL}")
+            camera = Camera(CAMERA_URL)
+            print("[CAMERA] ✅ 摄像头流连接成功。")
+        except RuntimeError as cam_error:
+            print(f"[CAMERA ERROR] {cam_error}")
+            print("[CAMERA] 尝试回退到本地摄像头 (index 0)...")
+            camera = Camera(0)  # 回退到本地 USB 摄像头
+            print("[CAMERA] ✅ 已使用本地摄像头。")
+
         hand_detector = HandDetector(model_path=HAND_MODEL_PATH, conf=0.5)
         card_detector = CardDetector()
         request_manager = RequestManager()
@@ -336,13 +360,13 @@ def main():
         state_machine = StateMachine()
         ui_manager.update_robot_state(state_machine.get_state().name)
         last_ui_state = state_machine.get_state()
-        speech_detector = SpeechRequestDetector(
-            microphone_index=None,
-            language="en-US",
-        )
-
-        speech_detector.start()
-        speech_detector.disable()
+        # speech_detector = SpeechRequestDetector(
+        #     microphone_index=None,
+        #     language="en-US",
+        # )
+        # 
+        # speech_detector.start()
+        # speech_detector.disable()
 
         # WAIT_CARD session guards:
         # - request_session_active: whether visual/speech detectors are armed
@@ -512,17 +536,17 @@ def main():
                 if hasattr(card_detector, "reset_session"):
                     card_detector.reset_session()
 
-                speech_detector.clear()
-                speech_detector.enable()
+                # speech_detector.clear()
+                # speech_detector.enable()
 
                 print_separator()
-                print("[REQUEST SESSION] Visual classification and speech are enabled.")
+                print("[REQUEST SESSION] Visual classification enabled.")
                 print("[REQUEST SESSION] The first valid source wins.")
                 print_separator()
 
             elif current_state != RobotState.WAIT_CARD and request_session_active:
-                speech_detector.disable()
-                speech_detector.clear()
+                # speech_detector.disable()
+                # speech_detector.clear()
                 request_session_active = False
 
             if current_state == RobotState.PATROL:
@@ -548,45 +572,77 @@ def main():
                         command_sent_for_state = current_state
 
             elif current_state == RobotState.WAIT_CARD:
-                # Both conditions are valid:
-                #   1. stable visual object classification
-                #   2. confirmed speech request
-                #
-                # The first valid result advances the state to GO_TEACHER.
+                # # Both conditions are valid:
+                # #   1. stable visual object classification
+                # #   2. confirmed speech request
+                # #
+                # # The first valid result advances the state to GO_TEACHER.
+                # if not request_accepted:
+                #     speech_raw = speech_detector.poll()
+                #     speech_event = None
+
+                #     if speech_raw is not None:
+                #         speech_event = normalize_speech_event(
+                #             speech_raw,
+                #             state_machine,
+                #         )
+
+                #     # If a speech result is already waiting, accept it without
+                #     # spending another frame on classification inference.
+                #     if speech_event is None:
+                #         visual_events = card_detector.detect(frame)
+                #     else:
+                #         visual_events = []
+
+                #     accepted_event = None
+
+                #     if speech_event is not None:
+                #         accepted_event = speech_event
+                #     elif visual_events:
+                #         accepted_event = dict(visual_events[0])
+                #         accepted_event.setdefault("source", "vision")
+
+                #     if accepted_event is not None:
+                #         # Main-level lock: prevents visual and speech from
+                #         # creating two tasks in the same student interaction.
+                #         request_accepted = True
+
+                #         # Stop listening immediately after the first accepted
+                #         # request. The next student session will re-enable it.
+                #         speech_detector.disable()
+                #         speech_detector.clear()
+
+                #         handle_request_event(
+                #             accepted_event,
+                #             request_manager,
+                #             task_queue,
+                #             state_machine,
+                #         )
+
+                #         center = accepted_event.get("center")
+                #         axis_x = center[0] if center else None
+                #         axis_y = center[1] if center else None
+                #         source = accepted_event.get("source", "vision")
+
+                #         ui_manager.update_request(
+                #             request_type="语音" if source == "speech" else "物品",
+                #             description=accepted_event.get("request", "unknown"),
+                #             message_id=(
+                #                 f"{source.upper()}-"
+                #                 f"{accepted_event.get('id', 'unknown')}"
+                #             ),
+                #             axis_x=axis_x,
+                #             axis_y=axis_y,
+                #         )
+
+                # Vision-only classification (speech disabled).
                 if not request_accepted:
-                    speech_raw = speech_detector.poll()
-                    speech_event = None
+                    visual_events = card_detector.detect(frame)
 
-                    if speech_raw is not None:
-                        speech_event = normalize_speech_event(
-                            speech_raw,
-                            state_machine,
-                        )
-
-                    # If a speech result is already waiting, accept it without
-                    # spending another frame on classification inference.
-                    if speech_event is None:
-                        visual_events = card_detector.detect(frame)
-                    else:
-                        visual_events = []
-
-                    accepted_event = None
-
-                    if speech_event is not None:
-                        accepted_event = speech_event
-                    elif visual_events:
+                    if visual_events:
                         accepted_event = dict(visual_events[0])
                         accepted_event.setdefault("source", "vision")
-
-                    if accepted_event is not None:
-                        # Main-level lock: prevents visual and speech from
-                        # creating two tasks in the same student interaction.
                         request_accepted = True
-
-                        # Stop listening immediately after the first accepted
-                        # request. The next student session will re-enable it.
-                        speech_detector.disable()
-                        speech_detector.clear()
 
                         handle_request_event(
                             accepted_event,
@@ -598,13 +654,12 @@ def main():
                         center = accepted_event.get("center")
                         axis_x = center[0] if center else None
                         axis_y = center[1] if center else None
-                        source = accepted_event.get("source", "vision")
 
                         ui_manager.update_request(
-                            request_type="语音" if source == "speech" else "物品",
+                            request_type="物品",
                             description=accepted_event.get("request", "unknown"),
                             message_id=(
-                                f"{source.upper()}-"
+                                f"VISION-"
                                 f"{accepted_event.get('id', 'unknown')}"
                             ),
                             axis_x=axis_x,
@@ -750,28 +805,43 @@ def main():
     finally:
         print("[MAIN] Releasing resources...")
 
-        if speech_detector is not None:
-            try:
-                speech_detector.disable()
-                speech_detector.stop()
-            except Exception as speech_error:
-                print(f"[SPEECH WARNING] Failed to stop cleanly: {speech_error}")
+        # 1. 先通知后台线程准备退出
+        shutdown_event.set()
 
+        # if speech_detector is not None:
+        #     try:
+        #         speech_detector.disable()
+        #         speech_detector.stop()
+        #     except Exception as speech_error:
+        #         print(f"[SPEECH WARNING] Failed to stop cleanly: {speech_error}")
+
+        # 2. 向小车发送停止指令
         if tcp_socket is not None:
             try:
                 print("[SAFETY] Sending stop command before shutdown...")
                 tcp_socket.sendall(b"S\n")
             except OSError:
                 pass
+
+        # 3. 释放摄像头
         if camera is not None:
             camera.release()
+
+        # 4. 关闭 TCP 连接
         if tcp_socket is not None:
             try:
                 tcp_socket.shutdown(socket.SHUT_RDWR)
             except OSError:
                 pass
-            tcp_socket.close()
-        cv2.destroyAllWindows()
+            finally:
+                tcp_socket.close()
+
+        # 5. 关闭 OpenCV 窗口（仅在 opencv-python 有 GUI 支持时可用）
+        try:
+            cv2.destroyAllWindows()
+        except cv2.error:
+            pass  # headless 版本无此功能，忽略即可
+
         print("[MAIN] Program closed.")
 
 
