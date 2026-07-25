@@ -9,6 +9,8 @@ from __future__ import annotations
 
 import asyncio
 import json
+import subprocess
+import sys
 import threading
 import time
 import uuid
@@ -20,6 +22,43 @@ from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect
 from fastapi.responses import HTMLResponse
 
 from ui_manager import UIManager
+
+
+def _configure_firewall(port: int) -> None:
+    """Add a Windows firewall inbound rule for the UI/audio port.
+
+    Without this rule, Windows may silently drop the Raspberry Pi's POST
+    requests to ``/api/audio`` arriving through the Tailscale/LAN interface.
+    The Pi's TCP SYNs then get no reply and the Pi stalls until its own
+    client-side timeout expires (previously a 20 second hang per prompt).
+    """
+    if sys.platform != "win32":
+        return
+    rule_name = f"RobotUIServer_Port{port}"
+    try:
+        check = subprocess.run(
+            ["netsh", "advfirewall", "firewall", "show", "rule", f"name={rule_name}"],
+            capture_output=True, text=True, timeout=5,
+            encoding="utf-8", errors="replace",
+        )
+        if check.returncode == 0 and "No rules match" not in check.stdout:
+            print(f"[FIREWALL] Inbound rule already exists: port {port}")
+            return
+        subprocess.run(
+            ["netsh", "advfirewall", "firewall", "add", "rule",
+             f"name={rule_name}", "dir=in", "action=allow",
+             "protocol=TCP", f"localport={port}"],
+            capture_output=True, timeout=5,
+            encoding="utf-8", errors="replace",
+        )
+        print(f"[FIREWALL] Added inbound rule: port {port}")
+    except Exception as error:
+        print(f"[FIREWALL WARNING] Could not configure port {port}: {error}")
+        print(
+            "[FIREWALL WARNING] Run once as administrator: "
+            f'netsh advfirewall firewall add rule name="{rule_name}" '
+            f"dir=in action=allow protocol=TCP localport={port}"
+        )
 
 
 HTML_PAGE = r"""
@@ -502,6 +541,8 @@ class UIServer:
                     self.active_connections.remove(connection)
 
     def run(self) -> None:
+        if self.host in ("0.0.0.0", ""):
+            _configure_firewall(self.port)
         if self.open_browser:
             threading.Timer(
                 1.0,
