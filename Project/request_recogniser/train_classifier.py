@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import argparse
 import csv
+import importlib.util
 import json
 import random
 from collections import Counter
@@ -193,6 +194,21 @@ def build_model(variant: str, pretrained: bool) -> nn.Module:
     return model
 
 
+def has_working_triton() -> bool:
+    """Return whether PyTorch can use Triton for the Inductor backend."""
+    try:
+        from torch.utils._triton import has_triton
+
+        return has_triton()
+    except (ImportError, AttributeError):
+        return importlib.util.find_spec("triton") is not None
+
+
+def is_triton_error(error: Exception) -> bool:
+    """Identify lazy Inductor failures caused by a missing or unusable Triton."""
+    return "triton" in str(error).lower() or "triton" in type(error).__name__.lower()
+
+
 def run_epoch(
     model: nn.Module,
     loader: DataLoader,
@@ -363,11 +379,16 @@ def main() -> None:
     scheduler = CosineAnnealingLR(optimizer, T_max=args.epochs)
     scaler = torch.amp.GradScaler("cuda", enabled=device.type == "cuda")
     training_model = model
-    if device.type == "cuda" and not args.no_compile and hasattr(torch, "compile"):
+    compile_enabled = device.type == "cuda" and not args.no_compile and hasattr(torch, "compile")
+    if compile_enabled and not has_working_triton():
+        compile_enabled = False
+        print("Triton is unavailable or unsupported; using eager mode. Pass --no-compile to silence this message.")
+    if compile_enabled:
         try:
             training_model = torch.compile(model, mode="default")
             print("Enabled torch.compile (Inductor kernel fusion; the first epoch may compile slowly).")
         except Exception as error:
+            compile_enabled = False
             print(f"torch.compile unavailable; continuing in eager mode: {error}")
     weights_dir = SCRIPT_DIR / "weights"
     best_path = weights_dir / "best_convnext.pth"
@@ -376,9 +397,19 @@ def main() -> None:
     stale_epochs = 0
 
     for epoch in range(1, args.epochs + 1):
-        train_loss, train_accuracy = run_epoch(
-            training_model, train_loader, criterion, device, optimizer, scaler, use_channels_last,
-        )
+        try:
+            train_loss, train_accuracy = run_epoch(
+                training_model, train_loader, criterion, device, optimizer, scaler, use_channels_last,
+            )
+        except Exception as error:
+            if not compile_enabled or not is_triton_error(error):
+                raise
+            compile_enabled = False
+            training_model = model
+            print(f"torch.compile could not initialize Triton; retrying epoch {epoch} in eager mode: {error}")
+            train_loss, train_accuracy = run_epoch(
+                training_model, train_loader, criterion, device, optimizer, scaler, use_channels_last,
+            )
         validation_loss, validation_accuracy = run_epoch(
             training_model, validation_loader, criterion, device,
             use_channels_last=use_channels_last,
