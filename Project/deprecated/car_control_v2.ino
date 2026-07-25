@@ -212,6 +212,7 @@ void moveDistance(float dist_cm) {
   Serial.print(abs(encoderCountRight));
   Serial.print(" Avg:");
   Serial.println((abs(encoderCountLeft) + abs(encoderCountRight)) / 2);
+  delay(1000);  // 指令执行完成后延时 1 秒再回复 Done
   Serial.println("Done");
 }
 
@@ -291,6 +292,7 @@ void turnAngle(float angle_deg) {
   Serial.print(abs(encoderCountRight));
   Serial.print(" Avg:");
   Serial.println((abs(encoderCountLeft) + abs(encoderCountRight)) / 2);
+  delay(1000);  // 指令执行完成后延时 1 秒再回复 Done
   Serial.println("Done");
 }
 

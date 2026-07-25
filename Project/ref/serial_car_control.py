@@ -36,6 +36,7 @@ import time
 import serial
 import serial.tools.list_ports
 import sys
+import threading
 
 
 # ==============================================================================
@@ -70,6 +71,8 @@ class CarSerial:
     REPLY_TURN_RIGHT     = "Turn Right"
     REPLY_INVALID_CMD    = "Unknown command"
     REPLY_TIMEOUT        = "Timeout"
+    REPLY_OBSTACLE_STOP  = "Obstacle Stop"   # 超声波守护触发，动作被中断
+    REPLY_EMERGENCY_STOP = "Emergency Stop"  # S 命令触发，动作被中断
 
     DEFAULT_BAUDRATE     = 9600
     DEFAULT_TIMEOUT      = 1.0
@@ -184,8 +187,11 @@ class CarSerial:
             time.sleep(0.5)
             print(f"  [模拟] 移动 {dist_cm} cm 完成")
             return True
-        reply = self._wait_for(lambda l: l in (self.REPLY_DONE, self.REPLY_TIMEOUT),
+        reply = self._wait_for(lambda l: l in (self.REPLY_DONE, self.REPLY_TIMEOUT,
+                                               self.REPLY_OBSTACLE_STOP),
                                self.MOVE_TIMEOUT, desc="G 命令完成")
+        if reply == self.REPLY_OBSTACLE_STOP:
+            print("  [障碍] 前方 30cm 内检测到障碍物，动作已中断")
         return reply == self.REPLY_DONE
 
     def turn_angle(self, angle_deg: float):
@@ -201,8 +207,11 @@ class CarSerial:
             time.sleep(0.5)
             print(f"  [模拟] 旋转 {angle_deg}° 完成")
             return True
-        reply = self._wait_for(lambda l: l in (self.REPLY_DONE, self.REPLY_TIMEOUT),
+        reply = self._wait_for(lambda l: l in (self.REPLY_DONE, self.REPLY_TIMEOUT,
+                                               self.REPLY_OBSTACLE_STOP),
                                self.MOVE_TIMEOUT, desc="T 命令完成")
+        if reply == self.REPLY_OBSTACLE_STOP:
+            print("  [障碍] 前方 30cm 内检测到障碍物，动作已中断")
         return reply == self.REPLY_DONE
 
     # ------------------------------------------------------------------
@@ -233,14 +242,20 @@ class CarSerial:
     # 循迹命令（HW-511，等待 Done）
     # ------------------------------------------------------------------
     def _track_command(self, cmd: str, desc: str) -> bool:
-        """发送循迹命令并阻塞等待 Done / Timeout，返回是否成功"""
+        """发送循迹命令并阻塞等待 Done / Timeout / Obstacle Stop，返回是否成功"""
         self._write(cmd)
         if self.simulation_mode:
             time.sleep(0.5)
             print(f"  [模拟] {desc} 完成")
             return True
-        reply = self._wait_for(lambda l: l in (self.REPLY_DONE, self.REPLY_TIMEOUT),
+        reply = self._wait_for(lambda l: l in (self.REPLY_DONE, self.REPLY_TIMEOUT,
+                                               self.REPLY_OBSTACLE_STOP,
+                                               self.REPLY_EMERGENCY_STOP),
                                self.TRACK_TIMEOUT, desc=desc)
+        if reply == self.REPLY_OBSTACLE_STOP:
+            print(f"  [障碍] 前方 30cm 内检测到障碍物，{desc} 已中断")
+        elif reply == self.REPLY_EMERGENCY_STOP:
+            print(f"  [急停] {desc} 已中断")
         return reply == self.REPLY_DONE
 
     def track_forward(self, n: int = 1) -> bool:
@@ -355,6 +370,26 @@ def interactive():
     print("=" * 50)
 
     car = CarSerial()
+    active_tracking = None
+
+    def run_tracking_action(desc, action):
+        """后台执行循迹，使控制台能立刻接受 S 急停命令。"""
+        nonlocal active_tracking
+        if active_tracking and active_tracking.is_alive():
+            print("  [提示] 当前已有循迹动作；可输入 S 立即停车")
+            return
+
+        def worker():
+            result = action()
+            if isinstance(result, bool):
+                print(f"  → {desc}{'成功' if result else '失败/中断/超时'}")
+            elif result is not None:
+                print(f"  → {desc}，行驶距离: {result:.1f} cm")
+            else:
+                print(f"  → {desc}失败/中断/超时")
+
+        active_tracking = threading.Thread(target=worker, daemon=True)
+        active_tracking.start()
 
     try:
         while True:
@@ -377,8 +412,9 @@ def interactive():
                     print("  → 用法: TF   或   TF 3")
                     continue
                 action = car.track_forward if upper.startswith('TF') else car.track_backward
-                ok = action(n)
-                print(f"  → {'成功' if ok else '失败/超时'}")
+                run_tracking_action(f"循迹前进至第{n}个路口" if upper.startswith('TF')
+                                    else f"循迹后退至第{n}个路口",
+                                    lambda: action(n))
             elif upper in ('CL', 'CR', 'PL', 'PR', 'PU', 'PN'):
                 actions = {
                     'CL': car.corner_left,
@@ -388,14 +424,9 @@ def interactive():
                     'PU': car.pivot_u_turn_intersection,
                     'PN': car.pivot_u_turn_line,
                 }
-                ok = actions[upper]()
-                print(f"  → {'成功' if ok else '失败/超时'}")
+                run_tracking_action(upper, actions[upper])
             elif upper == 'TO':
-                dist = car.track_until_obstacle()
-                if dist is not None:
-                    print(f"  → 循迹行驶距离: {dist:.1f} cm")
-                else:
-                    print("  → 探测超时")
+                run_tracking_action("循迹避障", car.track_until_obstacle)
             elif upper == 'F':
                 car.go_forward()
             elif upper == 'B':
