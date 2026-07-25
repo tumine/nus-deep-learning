@@ -102,7 +102,8 @@ python Project/request_recogniser/train_classifier.py --variant small --epochs 5
 ```text
 Project/request_recogniser/
 ├── weights/best_convnext.pth  # 验证准确率最高的 PyTorch 权重及类别元数据
-└── model.onnx                 # 动态 batch 维度的 ONNX 推理模型
+├── model.onnx                 # 动态 batch 维度的 ONNX 推理模型
+└── model.pt                   # TorchScript 推理模型，可通过 torch.jit.load 加载
 ```
 
 控制台还会输出验证集的 Precision、Recall、F1-score 和混淆矩阵。ONNX 输入名为 `image`，形状为 `[batch, 3, 224, 224]`；输出名为 `logits`，形状为 `[batch, 3]`，类别顺序固定为 `pencil`、`eraser`、`building_block`。

@@ -272,6 +272,17 @@ def export_onnx(model: nn.Module, output_path: Path, input_size: int, device: to
     print(f"Exported ONNX model: {output_path}")
 
 
+def export_torchscript(model: nn.Module, output_path: Path, input_size: int) -> None:
+    """Export a self-contained TorchScript model for PyTorch C++/Python inference."""
+    model = model.to("cpu").eval()
+    example = torch.randn(1, 3, input_size, input_size)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    with torch.inference_mode():
+        scripted_model = torch.jit.trace(model, example)
+    scripted_model.save(str(output_path))
+    print(f"Exported TorchScript model: {output_path}")
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="Fine-tune a pretrained ConvNeXt request recogniser.")
     parser.add_argument("--data", type=Path, default=SCRIPT_DIR / "collected_images")
@@ -400,6 +411,7 @@ def main() -> None:
     evaluate(model, validation_loader, device)
     if not args.no_export_onnx:
         export_onnx(model, SCRIPT_DIR / "model.onnx", input_size, device)
+    export_torchscript(model, SCRIPT_DIR / "model.pt", input_size)
 
 
 if __name__ == "__main__":
