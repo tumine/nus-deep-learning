@@ -56,6 +56,7 @@ class LabeledImageDataset(Dataset[tuple[torch.Tensor, int]]):
 
 def get_transforms(input_size: int) -> tuple[transforms.Compose, transforms.Compose]:
     """Create ImageNet-normalized transforms suitable for vehicle camera captures."""
+    # ConvNeXt ImageNet pretrained weights expect these normalization statistics.
     normalize = transforms.Normalize(
         mean=(0.485, 0.456, 0.406), std=(0.229, 0.224, 0.225)
     )
@@ -140,8 +141,10 @@ def discover_manifest_samples(data_dir: Path) -> list[tuple[Path, int]]:
 def load_samples(data_dir: Path) -> list[tuple[Path, int]]:
     if not data_dir.is_dir():
         raise FileNotFoundError(f"Dataset directory does not exist: {data_dir}")
+    # Class directories are the preferred output of the annotation workflow.
     samples = discover_folder_samples(data_dir)
     if not samples:
+        # Fall back to a manifest only when directory labels are unavailable.
         samples = discover_manifest_samples(data_dir)
     if not samples:
         raise FileNotFoundError(
@@ -164,6 +167,7 @@ def split_samples(samples: list[tuple[Path, int]], validation_ratio: float, seed
     train_samples: list[tuple[Path, int]] = []
     validation_samples: list[tuple[Path, int]] = []
     for label in range(len(CLASS_NAMES)):
+        # Split each class separately so all three labels occur in both datasets.
         class_samples = [sample for sample in samples if sample[1] == label]
         random_generator.shuffle(class_samples)
         validation_count = max(1, round(len(class_samples) * validation_ratio))
@@ -183,20 +187,34 @@ def build_model(variant: str, pretrained: bool) -> nn.Module:
     }
     builder, weights = model_builders[variant]
     model = builder(weights=weights if pretrained else None)
+    # Preserve the pretrained feature extractor and replace only its final head.
     input_features = model.classifier[-1].in_features
     model.classifier[-1] = nn.Linear(input_features, len(CLASS_NAMES))
     return model
 
 
-def run_epoch(model: nn.Module, loader: DataLoader, criterion: nn.Module, device: torch.device, optimizer: AdamW | None = None, scaler: torch.amp.GradScaler | None = None) -> tuple[float, float]:
+def run_epoch(
+    model: nn.Module,
+    loader: DataLoader,
+    criterion: nn.Module,
+    device: torch.device,
+    optimizer: AdamW | None = None,
+    scaler: torch.amp.GradScaler | None = None,
+    use_channels_last: bool = False,
+) -> tuple[float, float]:
     training = optimizer is not None
     model.train(training)
     total_loss = 0.0
     correct = 0
     total = 0
+    # AMP is enabled only on CUDA; CPU follows the same loop in full precision.
     amp_context = torch.amp.autocast(device_type="cuda") if device.type == "cuda" else nullcontext()
     for images, labels in loader:
-        images, labels = images.to(device, non_blocking=True), labels.to(device, non_blocking=True)
+        if use_channels_last:
+            images = images.to(device, non_blocking=True, memory_format=torch.channels_last)
+        else:
+            images = images.to(device, non_blocking=True)
+        labels = labels.to(device, non_blocking=True)
         if optimizer is not None:
             optimizer.zero_grad(set_to_none=True)
         with torch.set_grad_enabled(training):
@@ -205,6 +223,7 @@ def run_epoch(model: nn.Module, loader: DataLoader, criterion: nn.Module, device
                 loss = criterion(logits, labels)
             if optimizer is not None:
                 if scaler is not None:
+                    # GradScaler protects fp16 gradients from underflow on CUDA.
                     scaler.scale(loss).backward()
                     scaler.step(optimizer)
                     scaler.update()
@@ -223,6 +242,7 @@ def evaluate(model: nn.Module, loader: DataLoader, device: torch.device) -> None
     model.eval()
     for images, labels in loader:
         predictions = model(images.to(device, non_blocking=True)).argmax(dim=1).cpu().numpy()
+        # Rows are ground truth labels; columns are model predictions.
         for actual, predicted in zip(labels.numpy(), predictions):
             matrix[actual, predicted] += 1
 
@@ -246,6 +266,7 @@ def export_onnx(model: nn.Module, output_path: Path, input_size: int, device: to
     output_path.parent.mkdir(parents=True, exist_ok=True)
     torch.onnx.export(
         model, example, output_path, input_names=["image"], output_names=["logits"],
+        # A dynamic first dimension allows edge deployment with different batch sizes.
         dynamic_axes={"image": {0: "batch"}, "logits": {0: "batch"}}, opset_version=17,
     )
     print(f"Exported ONNX model: {output_path}")
@@ -262,9 +283,16 @@ def main() -> None:
     parser.add_argument("--label-smoothing", type=float, default=0.1)
     parser.add_argument("--patience", type=int, default=6)
     parser.add_argument("--seed", type=int, default=42)
-    parser.add_argument("--num-workers", type=int, default=4)
+    parser.add_argument("--num-workers", type=int, default=None,
+                        help="DataLoader worker count (default: automatically choose up to 12)")
+    parser.add_argument("--prefetch-factor", type=int, default=4,
+                        help="Batches each DataLoader worker prepares ahead of time")
     parser.add_argument("--no-pretrained", action="store_true", help="Do not download or load ImageNet weights.")
     parser.add_argument("--no-export-onnx", action="store_true")
+    parser.add_argument("--no-compile", action="store_true",
+                        help="Disable torch.compile CUDA kernel fusion")
+    parser.add_argument("--no-channels-last", action="store_true",
+                        help="Disable the CUDA-optimized NHWC memory layout")
     args = parser.parse_args()
 
     if not 0 < args.patience or args.epochs < 1:
@@ -274,28 +302,62 @@ def main() -> None:
     torch.manual_seed(args.seed)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     if device.type == "cuda":
+        # Benchmark is effective because every batch uses the same 224x224 shape.
         torch.backends.cudnn.benchmark = True
         torch.backends.cuda.matmul.allow_tf32 = True
         torch.backends.cudnn.allow_tf32 = True
+        torch.set_float32_matmul_precision("high")
         print(f"Using CUDA: {torch.cuda.get_device_name(0)} (AMP enabled)")
     else:
         print("CUDA is unavailable; training will run on CPU without AMP.")
 
     input_size = 224
     batch_size = args.batch_size or (32 if args.variant == "base" else 64)
+    num_workers = args.num_workers
+    if num_workers is None:
+        num_workers = min(12, max(1, (torch.get_num_threads() or 1)))
     samples = load_samples(args.data.resolve())
     train_samples, validation_samples = split_samples(samples, validation_ratio=0.15, seed=args.seed)
     print(f"Split: train={len(train_samples)}, validation={len(validation_samples)}")
     train_transform, validation_transform = get_transforms(input_size)
-    loader_settings = {"batch_size": batch_size, "num_workers": args.num_workers, "pin_memory": device.type == "cuda"}
-    train_loader = DataLoader(LabeledImageDataset(train_samples, train_transform), shuffle=True, **loader_settings)
-    validation_loader = DataLoader(LabeledImageDataset(validation_samples, validation_transform), shuffle=False, **loader_settings)
+    loader_settings = {
+        "batch_size": batch_size,
+        "num_workers": num_workers,
+        "pin_memory": device.type == "cuda",
+        "persistent_workers": num_workers > 0,
+    }
+    if num_workers > 0:
+        loader_settings["prefetch_factor"] = args.prefetch_factor
+    train_loader = DataLoader(
+        LabeledImageDataset(train_samples, train_transform), shuffle=True,
+        drop_last=len(train_samples) >= batch_size, **loader_settings,
+    )
+    validation_loader = DataLoader(
+        LabeledImageDataset(validation_samples, validation_transform), shuffle=False,
+        **loader_settings,
+    )
+    print(
+        f"DataLoader: batch_size={batch_size}, workers={num_workers}, "
+        f"persistent_workers={num_workers > 0}, prefetch_factor="
+        f"{args.prefetch_factor if num_workers > 0 else 'n/a'}"
+    )
 
     model = build_model(args.variant, pretrained=not args.no_pretrained).to(device)
+    use_channels_last = device.type == "cuda" and not args.no_channels_last
+    if use_channels_last:
+        model = model.to(memory_format=torch.channels_last)
+        print("Enabled channels_last (NHWC) memory format for ConvNeXt.")
     criterion = nn.CrossEntropyLoss(label_smoothing=args.label_smoothing)
     optimizer = AdamW(model.parameters(), lr=args.learning_rate, weight_decay=args.weight_decay)
     scheduler = CosineAnnealingLR(optimizer, T_max=args.epochs)
     scaler = torch.amp.GradScaler("cuda", enabled=device.type == "cuda")
+    training_model = model
+    if device.type == "cuda" and not args.no_compile and hasattr(torch, "compile"):
+        try:
+            training_model = torch.compile(model, mode="default")
+            print("Enabled torch.compile (Inductor kernel fusion; the first epoch may compile slowly).")
+        except Exception as error:
+            print(f"torch.compile unavailable; continuing in eager mode: {error}")
     weights_dir = SCRIPT_DIR / "weights"
     best_path = weights_dir / "best_convnext.pth"
     best_accuracy = -1.0
@@ -303,19 +365,26 @@ def main() -> None:
     stale_epochs = 0
 
     for epoch in range(1, args.epochs + 1):
-        train_loss, train_accuracy = run_epoch(model, train_loader, criterion, device, optimizer, scaler)
-        validation_loss, validation_accuracy = run_epoch(model, validation_loader, criterion, device)
+        train_loss, train_accuracy = run_epoch(
+            training_model, train_loader, criterion, device, optimizer, scaler, use_channels_last,
+        )
+        validation_loss, validation_accuracy = run_epoch(
+            training_model, validation_loader, criterion, device,
+            use_channels_last=use_channels_last,
+        )
         learning_rate = optimizer.param_groups[0]["lr"]
         print(
             f"Epoch {epoch:03d}/{args.epochs} | Train Loss {train_loss:.4f} | Train Acc {train_accuracy:.2%} | "
             f"Val Loss {validation_loss:.4f} | Val Acc {validation_accuracy:.2%} | LR {learning_rate:.2e}"
         )
         if validation_accuracy > best_accuracy:
+            # Save by accuracy for deployment, independent of early-stopping loss.
             weights_dir.mkdir(parents=True, exist_ok=True)
             torch.save({"model_state": model.state_dict(), "classes": CLASS_NAMES, "variant": args.variant, "input_size": input_size}, best_path)
             best_accuracy = validation_accuracy
             print(f"Saved best validation-accuracy model: {best_path}")
         if validation_loss < best_validation_loss:
+            # Validation loss drives early stopping because it is more sensitive to overfitting.
             best_validation_loss = validation_loss
             stale_epochs = 0
         else:
