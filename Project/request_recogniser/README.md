@@ -167,6 +167,21 @@ pip install --upgrade ultralytics
 
 然后重新执行环境检查。项目中旧版 `ultralytics>=8.0.0` 依赖范围较宽；YOLO-World 功能需要使用包含 `YOLOWorld` 类的版本。
 
+### 下载权重时出现 `SSL: UNEXPECTED_EOF_WHILE_READING`
+
+这表示首次下载 `yolov8s-worldv2.pt` 时 HTTPS 连接被远端、代理或网络设备提前关闭；它不是 CUDA、图片或模型配置错误。脚本默认会以指数退避自动重试 3 次，也可增加次数：
+
+```powershell
+python Project/request_recogniser/prepare_yolo_world.py --download-retries 5
+```
+
+若仍失败，检查网络是否能访问 GitHub 的发布文件地址，以及公司/校园网代理是否正确设置 `HTTPS_PROXY`。也可以用浏览器或可访问 GitHub 的网络下载官方 `yolov8s-worldv2.pt`，存放到本地后显式指定路径，从而完全跳过自动下载：
+
+```powershell
+python Project/request_recogniser/prepare_yolo_world.py `
+  --weights .\weights\yolov8s-worldv2.pt
+```
+
 ### CUDA 不可用
 
 安装与 NVIDIA 驱动匹配的 CUDA PyTorch，并确认运行的是同一个虚拟环境。可用 `nvidia-smi` 检查显卡和显存占用。
