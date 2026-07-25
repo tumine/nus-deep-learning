@@ -1,273 +1,180 @@
-# 小物体检测训练流程
+# 小物体无标注检测
 
-本目录用于训练一个识别手持细小物体的 YOLOv11n-P2 检测模型。目标类别固定为笔、橡皮和积木块，模型在 YOLO11 Nano 的基础上增加了 P2/4 检测头，以改善高分辨率画面中小目标的召回率。
+本目录的主方案是 **YOLO-World 零样本开放词汇检测**：为预训练模型设置英文文字提示词 `pen`、`eraser`、`building block`，即可检测图片中的笔、橡皮和积木块。此流程不需要本地图片标注、训练集划分、`dataset.yaml` 或模型微调。
 
-| 类别 ID | 类别名称 | 含义 |
+与原先的 YOLOv11n-P2 监督训练相比，这是一种“预训练模型 + 文字词表绑定”的部署准备过程，并不从本地图片学习。因此它能立刻用于未标注的小车鱼眼画面，但无法自动适应特定镜头的畸变、手部遮挡或非常细小的笔。
+
+| 类别 ID | 默认提示词 | 检测对象 |
 | --- | --- | --- |
 | `0` | `pen` | 笔 |
 | `1` | `eraser` | 橡皮 |
-| `2` | `building_block` | 积木块 |
+| `2` | `building block` | 积木块 |
 
 ## 文件说明
 
 | 文件 | 用途 |
 | --- | --- |
-| [collect_resource_images.py](collect_resource_images.py) | 从 Bing Images 搜集训练素材。 |
-| [auto_marker.py](auto_marker.py) | 使用 Grounding DINO 为图片生成初始 YOLO 标注。 |
-| [train_yolo_v11_p2.py](train_yolo_v11_p2.py) | 验证数据、划分训练/验证集并执行迁移学习训练。 |
-| [yolov11n-p2.yaml](yolov11n-p2.yaml) | YOLO11 Nano + P2 小目标检测头的网络定义。 |
+| [prepare_yolo_world.py](prepare_yolo_world.py) | 主脚本：绑定提示词、保存 YOLO-World 模型，并可直接预测未标注图片或视频。 |
+| [collect_resource_images.py](collect_resource_images.py) | 可选：搜集测试图片或日后微调素材。 |
+| [auto_marker.py](auto_marker.py) | 可选：用 Grounding DINO 生成伪标注。 |
+| [train_yolo_v11_p2.py](train_yolo_v11_p2.py) | 可选精度升级：只有拥有真实或伪标签时才使用的监督微调脚本。 |
+| [yolov11n-p2.yaml](yolov11n-p2.yaml) | 可选监督微调使用的 P2 小目标检测网络定义。 |
 
-## 训练流程概览
+## 原理与限制
 
-1. 准备包含图片和 YOLO 标注的源数据。
-2. 检查或修正自动标注结果，尤其是手部遮挡、鱼眼畸变和极小目标。
-3. 安装 CUDA 版 PyTorch 与项目依赖。
-4. 运行训练脚本。脚本会校验标注、以固定随机种子划分 85% 训练集和 15% 验证集、生成 `dataset.yaml`，然后加载 COCO 预训练权重进行微调。
-5. 检查 `best.pt`、验证指标和训练曲线；用真实小车摄像头画面做独立测试。
+YOLO-World 是开放词汇检测模型。它在大规模图文和检测数据上预训练，可以将图像区域与文字语义匹配；运行时调用 `set_classes()` 绑定目标文字，不需重新训练。Ultralytics 官方文档说明该模型支持动态自定义提示词而无需重训练：<https://docs.ultralytics.com/models/yolo-world/>。
 
-## 1. 数据准备
+必须区分以下两件事：
 
-### 1.1 推荐的数据布局
+- **无标注零样本检测**：本项目默认方案。无需标签、无需 epoch、无需 loss，也没有本地 `mAP50` 或 `mAP50-95`。
+- **监督微调**：若希望模型适应 160 度鱼眼、孩子手部遮挡和极小目标，需要边界框标注或高质量伪标注；这时使用 `train_yolo_v11_p2.py`。
 
-训练脚本接受以下两种布局，并递归扫描 `.jpg`、`.jpeg`、`.png`、`.bmp`、`.webp` 图片。
+没有任何模型能仅从完全未标注的本地图片中学习“哪个框对应笔、橡皮或积木块”并可靠计算检测精度。零样本模型依赖其已有的预训练知识；如需量化评估，至少应保留一小批人工框标注的独立测试集。
 
-**布局 A：图片和标签同级**
+## 1. 环境安装
+
+在仓库根目录安装 CUDA 版 PyTorch 和项目依赖。RTX 4070 必须被 PyTorch 正确识别。
+
+```powershell
+# 首次使用时创建环境
+python -m venv .venv
+.\.venv\Scripts\Activate.ps1
+
+# 安装 CUDA PyTorch。项目当前建议 cu126，请按实际驱动环境调整。
+pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu126
+
+# 安装 Ultralytics 与其余项目依赖
+pip install -e .
+```
+
+检查环境：
+
+```powershell
+python -c "import torch; print(torch.cuda.is_available()); print(torch.cuda.get_device_name(0))"
+python -c "from ultralytics import YOLOWorld; print('YOLOWorld ready')"
+```
+
+第一条命令必须显示 `True` 和 RTX 4070 名称。若 CUDA 不可用，脚本会停止而不会退回 CPU 推理。
+
+## 2. 准备零样本模型
+
+首次运行以下命令。Ultralytics 会下载预训练的 `yolov8s-worldv2.pt`，脚本将三个默认文字提示词写入模型并保存为本地部署文件。此命令不读取图片，不读取 `.txt` 标签，也不运行训练。
+
+```powershell
+python Project/request_recogniser/prepare_yolo_world.py
+```
+
+输出模型和日志位于：
+
+```text
+Project/request_recogniser/zero_shot_output/
+  yolov8s_world_school_objects.pt
+  prepare_yolo_world.log
+```
+
+默认使用 `yolov8s-worldv2.pt`，在精度、显存与速度之间比较适合 RTX 4070。若模型文件已在本地，可通过 `--weights` 指定路径：
+
+```powershell
+python Project/request_recogniser/prepare_yolo_world.py `
+  --weights .\weights\yolov8s-worldv2.pt
+```
+
+## 3. 使用未标注图片或视频检测
+
+`--source` 可以是单张图片、图片目录或视频文件。不需要任何同名 `.txt` 文件。
+
+```powershell
+python Project/request_recogniser/prepare_yolo_world.py `
+  --source Project/request_recogniser/collected_images `
+  --imgsz 800 `
+  --conf 0.15
+```
+
+预测结果保存在：
+
+```text
+Project/request_recogniser/zero_shot_output/predictions/
+```
+
+该目录包含带检测框的图片或视频，以及 Ultralytics 输出的预测文本文件。预测文本仅是模型的输出，不是训练所需标注。
+
+### RTX 4070 参数建议
+
+- `--imgsz 800`：默认值，适合 12 GB 显存，保留更多小目标细节。
+- `--imgsz 1024`：远距离笔或积木很小时可试用，推理更慢且显存占用更高。
+- `--conf 0.15`：零样本场景的起点；漏检多时尝试 `0.10`，误检多时尝试 `0.25` 或更高。
+- 默认模型为 `yolov8s-worldv2.pt`。如果速度不足，可改用 `--weights yolov8s-world.pt`；如果效果不足，应先优化提示词并检查真实画面，再考虑有标注微调。
+
+## 4. 调整提示词
+
+提示词顺序定义输出的类别 ID。可以一次传入多个英文提示词；含空格的提示词需要加引号：
+
+```powershell
+python Project/request_recogniser/prepare_yolo_world.py `
+  --prompts pencil "rubber eraser" "toy building block" `
+  --source Project/request_recogniser/collected_images
+```
+
+建议以同一组真实小车画面比较不同提示词组合。可尝试：
+
+| 目标 | 可比较的英文提示词 |
+| --- | --- |
+| 笔 | `pen`、`pencil`、`ballpoint pen`、`marker pen` |
+| 橡皮 | `eraser`、`rubber eraser`、`pencil eraser` |
+| 积木 | `building block`、`toy building block`、`toy brick` |
+
+避免同时放入语义重叠过强的词，例如既放 `pen` 又放 `pencil` 并把它们当成不同类别；这会使相同物体在多个类别之间竞争。应选择与实际目标类别一一对应的三个提示词。
+
+## 5. 无标注数据准备与人工验收
+
+准备真实小车摄像头的未标注图片或视频即可：
 
 ```text
 collected_images/
   frame_0001.jpg
-  frame_0001.txt
   frame_0002.jpg
-  frame_0002.txt
+  classroom_clip.mp4
 ```
 
-**布局 B：标准 YOLO `images/` 与 `labels/` 镜像目录**
+优先收集以下情况并人工查看预测结果：
 
-```text
-yolo_dataset/
-  images/
-    image_0001.jpg
-    image_0002.jpg
-  labels/
-    image_0001.txt
-    image_0002.txt
-```
+- 160 度鱼眼画面中央和边缘的物体；
+- 手指遮挡不同程度的笔、橡皮和积木；
+- 桌面、衣服、玩具等容易产生误检的背景；
+- 远距离、逆光、运动模糊、无目标画面。
 
-`auto_marker.py` 默认把 Grounding DINO 的输出写入 `Project/request_recogniser/yolo_dataset`，因此运行自动标注后，应使用布局 B 对应的路径作为 `--data-path`。
+在没有标注的前提下，验收应记录典型漏检和误检案例，而不是报告 mAP。若模型无法识别具体物体，先比较提示词、分辨率和置信度；这三项不改变模型参数，也不会从本地图片学习。
 
-### 1.2 YOLO 标签格式
+## 6. 何时进入可选的 YOLOv11-P2 微调
 
-每张图片应有一个同名 `.txt` 文件。每个目标占一行，字段顺序如下：
+若零样本方案在鱼眼或遮挡条件下效果不够，应切换到已有的监督微调方案。它需要边界框数据，不能满足“完全不提供图片标注”的约束：
 
-```text
-<class_id> <x_center> <y_center> <width> <height>
-```
+1. 用 [auto_marker.py](auto_marker.py) 生成初始伪标注，或人工绘制边界框。
+2. 抽查并修正伪标注，尤其是细笔、遮挡和鱼眼边缘目标。
+3. 运行 [train_yolo_v11_p2.py](train_yolo_v11_p2.py)。该脚本才会进行 85/15 划分、AMP 训练、早停和 mAP 验证。
 
-坐标必须相对于图片宽高归一化到 $[0, 1]$。例如，一支笔的标注可以是：
+该升级路径的价值是把真实相机域知识写入模型；其成本是必须维护标签质量。不要把自动生成的预测文本误认为独立的真实评估标签。
 
-```text
-0 0.5125 0.4800 0.3300 0.1200
-```
+## 7. 常见问题
 
-脚本会在训练前检查：
+### `YOLOWorld` 无法导入
 
-- 每行是否恰好包含 5 个数值字段；
-- 类别是否只在 `0`、`1`、`2` 之间；
-- 中心点、宽度和高度是否在合法归一化范围内；
-- 每张图片是否能找到匹配的标签文件。
-
-空的 `.txt` 文件代表没有目标的背景图，是合法数据。没有 `.txt` 的图片默认会令训练停止，避免无意中丢失标注；若这些图片确实是背景图，可加入 `--allow-unlabeled`，脚本会为它们生成空标签。
-
-### 1.3 标注质量建议
-
-自动标注只适合作为起点。训练前建议使用标注工具逐张抽查，并优先修正以下情况：
-
-- 目标被孩子手指遮挡时，框应覆盖仍可见的物体区域，而不是整只手。
-- 笔细长且倾斜时，边界框要覆盖笔尖和笔尾，避免将其裁成很短的局部。
-- 鱼眼边缘处的物体应按畸变后的实际像素范围标框。
-- 同一帧中多个物体分别标注；不要把笔和橡皮合成一个框。
-- 保留一部分无目标、模糊、逆光和强遮挡画面作为背景样本，降低误报。
-
-训练集和验证集都应包含来自真实 160 度鱼眼摄像头的画面。不要只用网络搜集的白底商品图，否则模型在小车摄像头中的距离、畸变、手部遮挡和背景条件下往往泛化较差。
-
-## 2. 环境安装
-
-项目需要 Python 3.11+、NVIDIA 驱动、CUDA 可用的 PyTorch，以及 `ultralytics`。在仓库根目录执行以下命令。
+升级 Ultralytics：
 
 ```powershell
-# 创建并激活虚拟环境（首次使用）
-python -m venv .venv
-.\.venv\Scripts\Activate.ps1
-
-# 安装与 NVIDIA 驱动匹配的 CUDA 版 PyTorch。
-# 项目 pyproject.toml 当前建议使用 cu126；根据实际环境调整版本。
-pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu126
-
-# 安装项目其余依赖（包括 Ultralytics、PyYAML、OpenCV 等）
-pip install -e .
+pip install --upgrade ultralytics
 ```
 
-安装后检查 GPU 是否可用：
-
-```powershell
-python -c "import torch; print(torch.cuda.is_available()); print(torch.cuda.get_device_name(0))"
-python -c "import ultralytics; print(ultralytics.__version__)"
-```
-
-第一条命令应显示 `True` 和 RTX 4070 的名称。若为 `False`，先不要启动训练；应检查 NVIDIA 驱动、CUDA PyTorch wheel 与当前 Python 环境是否一致。
-
-## 3. 开始训练
-
-在仓库根目录执行。默认数据路径为 `Project/request_recogniser/collected_images`，默认将拆分后的数据写入 `Project/request_recogniser/prepared_yolo_dataset`。
-
-```powershell
-python Project/request_recogniser/train_yolo_v11_p2.py --epochs 150 --batch-size 16 --imgsz 800
-```
-
-若数据由 `auto_marker.py` 生成：
-
-```powershell
-python Project/request_recogniser/train_yolo_v11_p2.py `
-  --data-path Project/request_recogniser/yolo_dataset `
-  --epochs 150 `
-  --batch-size 16 `
-  --imgsz 800
-```
-
-### 3.1 RTX 4070 推荐配置
-
-RTX 4070 有 12 GB 显存，建议先从以下配置开始：
-
-```powershell
-python Project/request_recogniser/train_yolo_v11_p2.py `
-  --data-path Project/request_recogniser/yolo_dataset `
-  --epochs 150 `
-  --imgsz 800 `
-  --batch-size 16 `
-  --workers 8
-```
-
-- `imgsz=800`：默认配置，兼顾小目标细节和显存压力。
-- `imgsz=1024`：小目标极小且显存允许时使用；建议先将 `--batch-size` 降至 `8` 或 `12`。
-- `batch-size=16`：12 GB 显存的保守起点。若发生 CUDA out-of-memory，依次尝试 `12`、`8`。
-- `batch-size=-1`：委托 Ultralytics 自动估算批次大小。
-- `workers=8`：可按 CPU 核心数、存储速度与 Windows 稳定性调整；数据加载卡顿或 worker 异常时尝试 `4`。
-
-首次启动时，Ultralytics 会下载默认的 COCO 预训练权重 `yolo11n.pt`。如网络受限，请先下载该文件并使用绝对或相对路径指定：
-
-```powershell
-python Project/request_recogniser/train_yolo_v11_p2.py --weights .\weights\yolo11n.pt
-```
-
-## 4. 脚本执行内容
-
-每次运行时，脚本会执行以下操作：
-
-1. 递归发现源图片及其标签，并验证类别和归一化框坐标。
-2. 用 `seed=42` 打乱样本，并按默认 85%/15% 分成训练集和验证集。
-3. 删除并重新生成 `prepared_yolo_dataset`，其中包含 `images/train`、`images/val`、`labels/train`、`labels/val` 与 `dataset.yaml`。由于该目录会被重建，不要在其中手工维护唯一副本的原始数据。
-4. 从 [yolov11n-p2.yaml](yolov11n-p2.yaml) 构建模型，再将 `yolo11n.pt` 中形状匹配的 COCO 权重迁移到自定义网络。
-5. 在 GPU `0` 上使用 AMP 混合精度训练，终端由 Ultralytics 实时输出损失、Precision、Recall、`mAP50` 和 `mAP50-95`。
-6. 训练结束后自动加载 `best.pt` 重新验证，并在日志中打印 `mAP50` 和 `mAP50-95`。
-
-## 5. 训练策略
-
-脚本默认采用面向小目标和遮挡的配置：
-
-| 配置 | 默认值 | 作用 |
-| --- | --- | --- |
-| AMP | 启用 | 使用 FP16 自动混合精度，降低显存占用并加快 RTX 4070 训练。 |
-| `cos_lr` | 启用 | Cosine 学习率衰减。 |
-| `lr0` | `0.01` | 初始学习率。 |
-| `lrf` | `0.01` | 训练结束时的学习率比例。 |
-| `weight_decay` | `0.0005` | 抑制过拟合。 |
-| `mosaic` | `1.0` | 拼接多张图片，增加目标尺度和背景组合多样性。 |
-| `scale` | `0.5` | 限制随机尺度增强强度，避免小目标经常缩小到不可见。 |
-| `copy_paste` | `0.3` | 增加物体组合与遮挡变化。 |
-| `close_mosaic` | `10` | 训练最后 10 个 epoch 关闭 Mosaic，使模型适应自然图片分布。 |
-| `patience` | `30` | 验证指标连续 30 个 epoch 无改进时早停。 |
-
-可按数据量调整：数据较少且验证指标波动大时，尝试降低 `--lr0` 至 `0.003`；若验证集持续优于训练集，不要立即提高模型规模，应先检查训练增强是否过强以及验证集是否过于简单。
-
-## 6. 常用参数
-
-```powershell
-python Project/request_recogniser/train_yolo_v11_p2.py --help
-```
-
-| 参数 | 默认值 | 说明 |
-| --- | --- | --- |
-| `--data-path` | `collected_images` | 原始图片与标注目录。 |
-| `--dataset-dir` | `prepared_yolo_dataset` | 自动生成的标准化数据集目录。该目录会被覆盖。 |
-| `--model-yaml` | `yolov11n-p2.yaml` | 模型网络定义文件。 |
-| `--weights` | `yolo11n.pt` | COCO 预训练权重路径或名称。 |
-| `--epochs` | `150` | 最大训练轮数。 |
-| `--batch-size` | `16` | 批次大小，`-1` 使用自动估算。 |
-| `--imgsz` | `800` | 训练分辨率，可选 `640`、`800`、`1024`。 |
-| `--val-ratio` | `0.15` | 验证集比例。 |
-| `--seed` | `42` | 数据拆分和训练随机种子。 |
-| `--patience` | `30` | 早停耐心值。 |
-| `--allow-unlabeled` | 关闭 | 将缺少 `.txt` 的图片作为无目标背景图。 |
-| `--project` | `runs/train` | 训练结果父目录。 |
-| `--name` | `yolov11n_p2_small_objects` | 当前实验输出目录名。 |
-| `--exist-ok` | 关闭 | 允许复用同名训练目录。 |
-
-## 7. 查看输出与结果
-
-默认训练结果位于：
-
-```text
-runs/train/yolov11n_p2_small_objects/
-  weights/
-    best.pt
-    last.pt
-  results.csv
-  results.png
-  confusion_matrix.png
-  PR_curve.png
-  F1_curve.png
-  args.yaml
-```
-
-- `weights/best.pt`：验证阶段表现最佳的模型，部署和后续测试优先使用它。
-- `weights/last.pt`：最后一个 epoch 的模型，可用于继续训练或排查早停前的状态。
-- `results.csv`：逐 epoch 的损失与指标数据。
-- `results.png`：损失、Precision、Recall 和 mAP 曲线。
-- `confusion_matrix.png`：类别混淆情况；检查笔、橡皮、积木块是否常被彼此误判。
-- `PR_curve.png`、`F1_curve.png`：选择部署置信度阈值时的参考曲线。
-
-数据准备和最终评估信息也会写入 `Project/request_recogniser/train_yolo_v11_p2.log`。需要区分多次实验时，指定不同名称：
-
-```powershell
-python Project/request_recogniser/train_yolo_v11_p2.py `
-  --data-path Project/request_recogniser/yolo_dataset `
-  --name fish_eye_1024_trial `
-  --imgsz 1024 `
-  --batch-size 8
-```
-
-## 8. 常见问题
-
-### 找不到图片或标签
-
-确认 `--data-path` 指向的是数据集根目录，而不是单个类别目录。对于自动标注输出，应指向 `yolo_dataset`。默认情况下，缺失标签会中止训练并列出最多 10 个问题图片；补齐标注后重试，或确认其为背景图后使用 `--allow-unlabeled`。
-
-### 标签类别超出范围或坐标非法
-
-本任务仅接受类别 `0` 至 `2`。标签中的中心点应为 $[0, 1]$，宽度和高度应为 $(0, 1]$。常见原因是像素坐标未归一化，或自动标注工具使用了不一致的类别映射。
+然后重新执行环境检查。项目中旧版 `ultralytics>=8.0.0` 依赖范围较宽；YOLO-World 功能需要使用包含 `YOLOWorld` 类的版本。
 
 ### CUDA 不可用
 
-训练脚本会拒绝在 CPU 上运行，因为高分辨率 P2 模型训练耗时过长。运行本 README 的 GPU 检查命令，并安装与驱动匹配的 CUDA PyTorch。不要只安装 PyPI 的 CPU 版 PyTorch。
+安装与 NVIDIA 驱动匹配的 CUDA PyTorch，并确认运行的是同一个虚拟环境。可用 `nvidia-smi` 检查显卡和显存占用。
 
-### CUDA out of memory
+### 模型未检测到细小物体
 
-先降低 `--batch-size`，再将 `--imgsz` 从 `1024` 调整到 `800` 或 `640`。确认没有其他应用占用 GPU 显存，并通过 `nvidia-smi` 检查进程。
+先使用 `--imgsz 1024` 和较低的 `--conf 0.10` 复测，再替换为更贴近物体外观的英文提示词。若仍然漏检，根本原因通常是零样本模型没有充分见过该摄像头域；需要少量高质量标注并切换到监督微调，而不是增加无标注图片数量。
 
-### 验证集 mAP 很低或波动很大
+### 误检较多
 
-优先检查图片和标签质量、三个类别的样本数量是否失衡，以及验证集是否包含真实鱼眼和手部遮挡场景。数据量少时，单次 15% 随机划分可能造成较大波动；保持 `--seed` 不变以便公平比较实验，或在数据量增长后重新训练。
-
-## 9. 部署前检查
-
-在将 `best.pt` 集成进小车系统前，应使用从未参与训练或验证的真实摄像头录像进行测试，并记录每类物体在不同距离、光照、遮挡程度和鱼眼位置下的漏检与误检。部署阈值应根据验证集 PR/F1 曲线和实际误报成本确定，而不是固定沿用默认置信度。
+提高 `--conf`，缩小提示词语义范围，例如用 `rubber eraser` 替代宽泛的 `eraser`，并用无目标背景画面检查效果。无标注模式无法自动从这些误检中更新权重。

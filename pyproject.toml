@@ -3,7 +3,7 @@ name = "nus-deep-learning"
 version = "0.1.0"
 requires-python = ">=3.11"
 dependencies = [
-    "ultralytics>=8.0.0",
+    "ultralytics>=8.3.0",  # YOLOWorld 零样本开放词汇检测 API
     "opencv-python>=4.8.0,<5.0.0",  # headless 版无 GUI 支持，不可用 opencv-python-headless
     "numpy>=1.24.0",
     "pyyaml>=6.0",
