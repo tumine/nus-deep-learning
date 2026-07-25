@@ -54,7 +54,25 @@ def tcp_server_listener(hw):
 
     server_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     server_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-    server_socket.bind((HOST, PORT))
+    # Linux 下额外设置 SO_REUSEPORT，允许多个 socket 绑定同一端口
+    try:
+        server_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEPORT, 1)
+    except (AttributeError, OSError):
+        pass  # 非 Linux 或不支持则忽略
+
+    # 绑定重试：如果端口被占用，最多重试 5 次
+    max_retries = 5
+    for attempt in range(max_retries):
+        try:
+            server_socket.bind((HOST, PORT))
+            break
+        except OSError:
+            if attempt < max_retries - 1:
+                print(f"⚠️  端口 {PORT} 被占用，2 秒后重试 ({attempt + 1}/{max_retries})...")
+                time.sleep(2)
+            else:
+                raise
+
     server_socket.listen(1)
     print(f"\n📡 [网络通信] TCP 服务端已启动，正在端口 {PORT} 等待电脑端连接...")
 
@@ -281,8 +299,11 @@ class CarController:
         self.execute_cmd(cmd_str)
         self.pos_y = target_y
 
-    def wait_for_signal(self, valid_signals, timeout=None):
+    def wait_for_signal(self, valid_signals, timeout=None, button_arm_signal=None):
         print(f"\n[等待指令] 正在监听控制信号 {valid_signals} (输入 S 可随时紧急停车) ...")
+        button_armed = button_arm_signal is None
+        if button_arm_signal is not None:
+            print("    [按键锁定] 等待提示音播放完成后由电脑端解锁。")
         
         if timeout is not None:
             print(f"    [超时设置] {timeout} 秒内未收到有效信号将自动继续。")
@@ -295,8 +316,11 @@ class CarController:
                 try:
                     line = self.hw.ser.readline().decode('utf-8').strip()
                     if line == "BTN":
-                        print(f"\n🔘 [硬件按键] 收到 Arduino 物理按键触发！正在通过网络告知电脑端...")
-                        send_status_to_pc("button_pressed")
+                        if button_armed:
+                            print(f"\n🔘 [硬件按键] 收到 Arduino 物理按键触发！正在通过网络告知电脑端...")
+                            send_status_to_pc("button_pressed")
+                        else:
+                            print("[硬件按键] 提示音尚未完成，本次按键已忽略。")
                     # 【新增】捕获底层发来的障碍物急停信号
                     elif line == "Obstacle Stop":
                         print("\n🛑 [底层安全警报] 硬件触发全局障碍物急停！正在同步中断 Python 业务流...")
@@ -307,7 +331,10 @@ class CarController:
             
             try:
                 sig = signal_queue.get(timeout=0.1)
-                if sig in valid_signals:
+                if sig == button_arm_signal:
+                    button_armed = True
+                    print("[按键解锁] 电脑端已确认提示音播放完成。")
+                elif sig in valid_signals:
                     print(f"[捕获成功] 系统收到业务指令: '{sig}'，继续向下执行。")
                     return sig
                 else:
@@ -345,7 +372,10 @@ class CarController:
         self.pos_x = -1
         send_status_to_pc("arrived_teacher")
         
-        self.wait_for_signal(["return_student"])
+        self.wait_for_signal(
+            ["return_student"],
+            button_arm_signal="arm_loading_button",
+        )
         
         # 3. 【连续行驶】从起点出发，直接连续开回目标现场路口
         print(" -> [连续重返现场] 正在从起点连续开回主路并直达交叉口...")
@@ -365,7 +395,10 @@ class CarController:
         self.pos_x = branch_x
         send_status_to_pc("arrived_student")
         
-        self.wait_for_signal(["return_patrol"])
+        self.wait_for_signal(
+            ["return_patrol"],
+            button_arm_signal="arm_unload_button",
+        )
         
         # 4. 退出分叉点，姿态补偿
         print(" -> [姿态补偿] 线上180度掉头并退回交叉口...")

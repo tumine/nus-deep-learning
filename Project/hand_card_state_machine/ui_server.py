@@ -9,7 +9,10 @@ from __future__ import annotations
 
 import asyncio
 import json
+import subprocess
+import sys
 import threading
+import time
 import uuid
 import webbrowser
 from typing import Any
@@ -19,6 +22,43 @@ from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect
 from fastapi.responses import HTMLResponse
 
 from ui_manager import UIManager
+
+
+def _configure_firewall(port: int) -> None:
+    """Add a Windows firewall inbound rule for the UI/audio port.
+
+    Without this rule, Windows may silently drop the Raspberry Pi's POST
+    requests to ``/api/audio`` arriving through the Tailscale/LAN interface.
+    The Pi's TCP SYNs then get no reply and the Pi stalls until its own
+    client-side timeout expires (previously a 20 second hang per prompt).
+    """
+    if sys.platform != "win32":
+        return
+    rule_name = f"RobotUIServer_Port{port}"
+    try:
+        check = subprocess.run(
+            ["netsh", "advfirewall", "firewall", "show", "rule", f"name={rule_name}"],
+            capture_output=True, text=True, timeout=5,
+            encoding="utf-8", errors="replace",
+        )
+        if check.returncode == 0 and "No rules match" not in check.stdout:
+            print(f"[FIREWALL] Inbound rule already exists: port {port}")
+            return
+        subprocess.run(
+            ["netsh", "advfirewall", "firewall", "add", "rule",
+             f"name={rule_name}", "dir=in", "action=allow",
+             "protocol=TCP", f"localport={port}"],
+            capture_output=True, timeout=5,
+            encoding="utf-8", errors="replace",
+        )
+        print(f"[FIREWALL] Added inbound rule: port {port}")
+    except Exception as error:
+        print(f"[FIREWALL WARNING] Could not configure port {port}: {error}")
+        print(
+            "[FIREWALL WARNING] Run once as administrator: "
+            f'netsh advfirewall firewall add rule name="{rule_name}" '
+            f"dir=in action=allow protocol=TCP localport={port}"
+        )
 
 
 HTML_PAGE = r"""
@@ -198,6 +238,7 @@ function enablePhoneAudio(){
 function playBrowserAudio(data){
   let completed=false;
   let audioUrl=null;
+  log(`Received audio playback request ${data.request_id}.`);
   const complete=played=>{
     if(completed) return;
     completed=true;
@@ -211,10 +252,15 @@ function playBrowserAudio(data){
     for(let index=0;index<binary.length;index++) bytes[index]=binary.charCodeAt(index);
     audioUrl=URL.createObjectURL(new Blob([bytes],{type:data.media_type||"audio/mp4"}));
     const audio=new Audio(audioUrl);
+    audio.addEventListener("playing",()=>log(`Audio playback started: ${data.request_id}.`),{once:true});
     audio.addEventListener("ended",()=>complete(true),{once:true});
     audio.addEventListener("error",()=>complete(false),{once:true});
-    audio.play().catch(()=>complete(false));
+    audio.play().catch(error=>{
+      log(`Audio playback could not start: ${error.name||"unknown error"}.`);
+      complete(false);
+    });
   }catch(error){
+    log(`Audio payload could not be prepared: ${error.name||"unknown error"}.`);
     complete(false);
   }
 }
@@ -321,6 +367,7 @@ class UIServer:
         self.active_connections: list[WebSocket] = []
         self.audio_enabled_connections: list[WebSocket] = []
         self._audio_playback_waiters: dict[str, asyncio.Future[bool]] = {}
+        self._audio_playback_traces: dict[str, str] = {}
         self._register_routes()
 
     def _get_audio_connection(self) -> WebSocket | None:
@@ -346,9 +393,23 @@ class UIServer:
 
         @self.app.post("/api/audio")
         async def play_audio(audio_payload: dict[str, Any]) -> dict[str, bool]:
+            request_started = time.monotonic()
+            trace_id = str(audio_payload.get("trace_id") or uuid.uuid4().hex[:8])
+            audio_id = audio_payload.get("audio_id", "unknown")
+            filename = audio_payload.get("filename", "unknown")
+            encoded_size = len(str(audio_payload.get("audio_base64", "")))
+            print(
+                f"[AUDIO {trace_id}] Received audio {audio_id} ({filename}); "
+                f"base64={encoded_size} characters. Waiting for an enabled browser."
+            )
             audio_connection = await self._wait_for_audio_connection()
 
             if audio_connection is None:
+                elapsed = time.monotonic() - request_started
+                print(
+                    f"[AUDIO {trace_id}] No enabled browser after {elapsed:.2f}s; "
+                    "rejecting playback request."
+                )
                 raise HTTPException(
                     status_code=503,
                     detail="No browser has enabled phone audio playback.",
@@ -357,6 +418,7 @@ class UIServer:
             request_id = str(uuid.uuid4())
             completion = asyncio.get_running_loop().create_future()
             self._audio_playback_waiters[request_id] = completion
+            self._audio_playback_traces[request_id] = trace_id
             try:
                 await audio_connection.send_json(
                     {
@@ -368,10 +430,19 @@ class UIServer:
                         },
                     }
                 )
+                print(
+                  f"[AUDIO {trace_id}] Sent playback request {request_id} "
+                  "to the enabled browser; waiting for its completion signal."
+                )
             except Exception as error:
                 self._audio_playback_waiters.pop(request_id, None)
+                self._audio_playback_traces.pop(request_id, None)
                 if audio_connection in self.audio_enabled_connections:
                     self.audio_enabled_connections.remove(audio_connection)
+                elapsed = time.monotonic() - request_started
+                print(
+                  f"[AUDIO {trace_id}] Browser send failed after {elapsed:.2f}s: {error}"
+                )
                 raise HTTPException(
                     status_code=503,
                     detail="Phone audio connection is unavailable.",
@@ -381,9 +452,20 @@ class UIServer:
                 played = await asyncio.wait_for(completion, timeout=15.0)
             except TimeoutError:
                 played = False
+                elapsed = time.monotonic() - request_started
+                print(
+                    f"[AUDIO {trace_id}] Browser did not report playback completion "
+                    f"within 15.0s (elapsed {elapsed:.2f}s)."
+                )
             finally:
                 self._audio_playback_waiters.pop(request_id, None)
+                self._audio_playback_traces.pop(request_id, None)
 
+            elapsed = time.monotonic() - request_started
+            print(
+                f"[AUDIO {trace_id}] Returning playback result played={played} "
+                f"after {elapsed:.2f}s."
+            )
             return {"played": played}
 
         @self.app.websocket("/ws")
@@ -413,11 +495,18 @@ class UIServer:
                     elif message.get("type") == "enable_audio":
                         if websocket not in self.audio_enabled_connections:
                             self.audio_enabled_connections.append(websocket)
+                        print("[AUDIO] Browser enabled phone audio playback.")
                     elif message.get("type") == "audio_playback_complete":
                         request_id = str(message.get("request_id", ""))
                         completion = self._audio_playback_waiters.get(request_id)
                         if completion is not None and not completion.done():
-                            completion.set_result(bool(message.get("played")))
+                          played = bool(message.get("played"))
+                          trace_id = self._audio_playback_traces.get(request_id, "unknown")
+                          print(
+                            f"[AUDIO {trace_id}] Browser reported playback "
+                            f"completion for {request_id}; played={played}."
+                          )
+                          completion.set_result(played)
 
             except WebSocketDisconnect:
                 pass
@@ -452,6 +541,8 @@ class UIServer:
                     self.active_connections.remove(connection)
 
     def run(self) -> None:
+        if self.host in ("0.0.0.0", ""):
+            _configure_firewall(self.port)
         if self.open_browser:
             threading.Timer(
                 1.0,
