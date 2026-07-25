@@ -19,6 +19,7 @@ import queue
 import sys
 
 from camera import Camera
+from audio_dispatcher import play_audio_blocking
 from card_detector_classifier import CardDetector
 from speech_request_detector import SpeechRequestDetector
 from hand_detector import HandDetector
@@ -144,13 +145,40 @@ def handle_hand_event(hand_event, state_machine):
     state_machine.set_state(RobotState.APPROACH_STUDENT)
 
 
-def handle_request_event(request_event, request_manager, task_queue, state_machine):
+def play_audio_with_feedback(audio_id, ui_manager):
+    """Play prerecorded audio in the browser and report its result."""
+    start_message = f"[AUDIO] Starting browser playback for audio {audio_id}."
+    print(start_message)
+    ui_manager.publish("audio_playback", {"message": start_message})
+
+    try:
+        played = play_audio_blocking(audio_id)
+    except (FileNotFoundError, ValueError) as audio_error:
+        result_message = f"[AUDIO WARNING] {audio_error}"
+        print(result_message)
+        ui_manager.publish("audio_playback", {"message": result_message})
+        return False
+
+    if played:
+        result_message = f"[AUDIO] Browser playback completed for audio {audio_id}."
+    else:
+        result_message = f"[AUDIO WARNING] Browser playback failed or timed out for audio {audio_id}."
+
+    print(result_message)
+    ui_manager.publish("audio_playback", {"message": result_message})
+    return played
+
+
+def handle_request_event(request_event, request_manager, task_queue, state_machine, ui_manager):
     """
     Create and store one task from either visual classification or speech.
 
     Both sources are normalized to the structure required by RequestManager.
     A valid event always advances WAIT_CARD -> GO_TEACHER.
     """
+    audio_id = 3 if request_event.get("request") == "teacher" else 2
+    play_audio_with_feedback(audio_id, ui_manager)
+
     task = request_manager.create_task(request_event)
     task["student_context"] = state_machine.get_context()
     task["request_source"] = request_event.get("source", "vision")
@@ -584,6 +612,7 @@ def main(speech_detector=None):
                             request_manager,
                             task_queue,
                             state_machine,
+                            ui_manager,
                         )
 
                         center = accepted_event.get("center")

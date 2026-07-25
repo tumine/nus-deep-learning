@@ -10,10 +10,12 @@ from __future__ import annotations
 import asyncio
 import json
 import threading
+import uuid
 import webbrowser
+from typing import Any
 
 import uvicorn
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect
+from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect
 from fastapi.responses import HTMLResponse
 
 from ui_manager import UIManager
@@ -153,6 +155,38 @@ function renderRequests(){
     return `<tr><td>${time}</td><td>${r.message_id||"-"}</td><td>${r.request||"-"}</td><td>${r.description||"-"}</td><td>${pos}</td></tr>`;
   }).join("");
 }
+function reportAudioPlayback(requestId, played){
+  if(socket&&socket.readyState===WebSocket.OPEN){
+    socket.send(JSON.stringify({
+      type:"audio_playback_complete",
+      request_id:requestId,
+      played
+    }));
+  }
+}
+function playBrowserAudio(data){
+  let completed=false;
+  let audioUrl=null;
+  const complete=played=>{
+    if(completed) return;
+    completed=true;
+    if(audioUrl) URL.revokeObjectURL(audioUrl);
+    reportAudioPlayback(data.request_id,played);
+    log(played?"Audio playback completed.":"Audio playback failed.");
+  };
+  try{
+    const binary=atob(data.audio_base64||"");
+    const bytes=new Uint8Array(binary.length);
+    for(let index=0;index<binary.length;index++) bytes[index]=binary.charCodeAt(index);
+    audioUrl=URL.createObjectURL(new Blob([bytes],{type:data.media_type||"audio/mp4"}));
+    const audio=new Audio(audioUrl);
+    audio.addEventListener("ended",()=>complete(true),{once:true});
+    audio.addEventListener("error",()=>complete(false),{once:true});
+    audio.play().catch(()=>complete(false));
+  }catch(error){
+    complete(false);
+  }
+}
 function handleMessage(message){
   const type=message.type;
   const data=message.data||{};
@@ -181,6 +215,11 @@ function handleMessage(message){
     document.getElementById("currentRequest").textContent=data.description||"-";
     renderRequests();
     log(`New request: ${data.description||"-"}`);
+  }else if(type==="audio_playback"){
+    log(data.message||"Audio playback update.");
+  }else if(type==="play_audio"){
+    log("Starting browser audio playback.");
+    playBrowserAudio(data);
   }
 }
 function connect(){
@@ -241,12 +280,39 @@ class UIServer:
         self.open_browser = open_browser
         self.app = FastAPI()
         self.active_connections: list[WebSocket] = []
+        self._audio_playback_waiters: dict[str, asyncio.Future[bool]] = {}
         self._register_routes()
 
     def _register_routes(self) -> None:
         @self.app.get("/")
         async def root() -> HTMLResponse:
             return HTMLResponse(HTML_PAGE)
+
+        @self.app.post("/api/audio")
+        async def play_audio(audio_payload: dict[str, Any]) -> dict[str, bool]:
+            if not self.active_connections:
+                raise HTTPException(status_code=503, detail="No browser is connected for audio playback.")
+
+            request_id = str(uuid.uuid4())
+            completion = asyncio.get_running_loop().create_future()
+            self._audio_playback_waiters[request_id] = completion
+            self.ui_manager.publish(
+                "play_audio",
+                {
+                    "request_id": request_id,
+                    "audio_base64": str(audio_payload.get("audio_base64", "")),
+                    "media_type": str(audio_payload.get("media_type", "audio/mp4")),
+                },
+            )
+
+            try:
+                played = await asyncio.wait_for(completion, timeout=15.0)
+            except TimeoutError:
+                played = False
+            finally:
+                self._audio_playback_waiters.pop(request_id, None)
+
+            return {"played": played}
 
         @self.app.websocket("/ws")
         async def websocket_endpoint(websocket: WebSocket) -> None:
@@ -272,6 +338,11 @@ class UIServer:
                         command = str(message.get("command", "")).upper()
                         if command:
                             self.ui_manager.submit_command(command)
+                    elif message.get("type") == "audio_playback_complete":
+                        request_id = str(message.get("request_id", ""))
+                        completion = self._audio_playback_waiters.get(request_id)
+                        if completion is not None and not completion.done():
+                            completion.set_result(bool(message.get("played")))
 
             except WebSocketDisconnect:
                 pass

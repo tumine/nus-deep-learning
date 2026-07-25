@@ -29,7 +29,7 @@ from state_machine import StateMachine, RobotState
 from task_queue import TaskQueue
 
 from ui_manager import UIManager
-from ui_server import UIServer, generate_self_signed_cert
+from ui_server import UIServer
 
 # ==============================================================================
 # ⚠️ 系统及网络配置区 
@@ -315,7 +315,6 @@ def main():
         ui_manager=ui_manager,
         host="0.0.0.0",
         port=8000,
-        ssl_certfile=None,  # 改为 generate_self_signed_cert() 的返回值以启用 HTTPS
     )
 
     ui_server.start_in_thread()
