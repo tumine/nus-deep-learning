@@ -371,6 +371,7 @@ def main(speech_detector=None):
 
         # 记录上一次发送指令时的状态，防止在同一个状态下一帧一帧疯狂重复发指令
         command_sent_for_state = None
+        audio_prompt_state = None
 
         print("\n[MAIN] 状态触发控制说明:")
         print("  ▶ 正常情况：小车通过网络自动发送触发信号，自动跳转流程。")
@@ -519,6 +520,15 @@ def main(speech_detector=None):
             current_state = state_machine.get_state()
             if command_sent_for_state != current_state:
                 command_sent_for_state = None
+
+            # Play arrival instructions once, regardless of whether the state
+            # transition came from TCP feedback or a keyboard simulation.
+            if current_state != audio_prompt_state:
+                audio_prompt_state = current_state
+                if current_state == RobotState.WAIT_LOADING:
+                    play_audio_with_feedback(4, ui_manager)
+                elif current_state == RobotState.WAIT_UNLOAD:
+                    play_audio_with_feedback(5, ui_manager)
 
             # --------------------------------------------------------------
             # Open exactly one visual/speech request session per student.

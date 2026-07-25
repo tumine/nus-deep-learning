@@ -128,6 +128,7 @@ let socket = null;
 let requests = [];
 let phoneAudioEnabled = false;
 let audioContext = null;
+const reconnectDelayMilliseconds = 500;
 
 function log(text){
   const box=document.getElementById("eventLog");
@@ -271,7 +272,7 @@ function connect(){
   socket.onclose=()=>{
     const n=document.getElementById("wsStatus");
     n.textContent="● WebSocket disconnected";n.className="offline";
-    setTimeout(connect,3000);
+    setTimeout(connect,reconnectDelayMilliseconds);
   };
 }
 function sendCommand(command){
@@ -322,6 +323,22 @@ class UIServer:
         self._audio_playback_waiters: dict[str, asyncio.Future[bool]] = {}
         self._register_routes()
 
+    def _get_audio_connection(self) -> WebSocket | None:
+        for connection in reversed(self.audio_enabled_connections):
+            if connection in self.active_connections:
+                return connection
+        return None
+
+    async def _wait_for_audio_connection(self) -> WebSocket | None:
+        """Allow a briefly disconnected phone UI to reconnect and re-enable audio."""
+        deadline = asyncio.get_running_loop().time() + 5.0
+        while asyncio.get_running_loop().time() < deadline:
+            connection = self._get_audio_connection()
+            if connection is not None:
+                return connection
+            await asyncio.sleep(0.1)
+        return None
+
     def _register_routes(self) -> None:
         @self.app.get("/")
         async def root() -> HTMLResponse:
@@ -329,11 +346,7 @@ class UIServer:
 
         @self.app.post("/api/audio")
         async def play_audio(audio_payload: dict[str, Any]) -> dict[str, bool]:
-            audio_connection: WebSocket | None = None
-            for connection in reversed(self.audio_enabled_connections):
-                if connection in self.active_connections:
-                    audio_connection = connection
-                    break
+            audio_connection = await self._wait_for_audio_connection()
 
             if audio_connection is None:
                 raise HTTPException(
@@ -398,8 +411,8 @@ class UIServer:
                         if command:
                             self.ui_manager.submit_command(command)
                     elif message.get("type") == "enable_audio":
-                      if websocket not in self.audio_enabled_connections:
-                        self.audio_enabled_connections.append(websocket)
+                        if websocket not in self.audio_enabled_connections:
+                            self.audio_enabled_connections.append(websocket)
                     elif message.get("type") == "audio_playback_complete":
                         request_id = str(message.get("request_id", ""))
                         completion = self._audio_playback_waiters.get(request_id)
@@ -412,7 +425,7 @@ class UIServer:
                 if websocket in self.active_connections:
                     self.active_connections.remove(websocket)
                 if websocket in self.audio_enabled_connections:
-                  self.audio_enabled_connections.remove(websocket)
+                    self.audio_enabled_connections.remove(websocket)
 
         @self.app.on_event("startup")
         async def startup_event() -> None:
