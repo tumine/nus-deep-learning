@@ -564,28 +564,39 @@ def main(speech_detector=None):
             if command_sent_for_state != current_state:
                 command_sent_for_state = None
 
-            # Play arrival instructions once, regardless of whether the state
-            # transition came from TCP feedback or a keyboard simulation.
+            # Arrival prompts are synchronous gates. No movement, detector, or
+            # physical-button step is unlocked until the phone confirms playback.
             if current_state != audio_prompt_state:
-                audio_prompt_state = current_state
                 if current_state == RobotState.WAIT_LOADING:
-                    play_audio_with_feedback(4, ui_manager)
+                    if not play_audio_with_feedback(4, ui_manager):
+                        continue
+                    send_robot_command(
+                        tcp_socket,
+                        {"command": "arm_loading_button"},
+                    )
                 elif current_state == RobotState.WAIT_UNLOAD:
-                    play_audio_with_feedback(5, ui_manager)
+                    if not play_audio_with_feedback(5, ui_manager):
+                        continue
+                    send_robot_command(
+                        tcp_socket,
+                        {"command": "arm_unload_button"},
+                    )
+                audio_prompt_state = current_state
 
             # --------------------------------------------------------------
             # Open exactly one visual/speech request session per student.
             # This works for both TCP arrival and keyboard simulation.
             # --------------------------------------------------------------
             if current_state == RobotState.WAIT_CARD and not request_session_active:
+                print("[AUDIO] Robot arrived at student; playing request prompt.")
+                if not play_audio_with_feedback(1, ui_manager):
+                    continue
+
                 request_accepted = False
                 request_session_active = True
 
                 if hasattr(card_detector, "reset_session"):
                     card_detector.reset_session()
-
-                print("[AUDIO] Robot arrived at student; playing request prompt.")
-                play_audio_with_feedback(1, ui_manager)
 
                 speech_detector.clear()
                 speech_detector.enable()

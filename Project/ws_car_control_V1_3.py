@@ -1,8 +1,4 @@
-"""Voice-aware vehicle controller.
-
-Run this on the vehicle host. Set ``ROBOT_AUDIO_SERVER_URL`` to the laptop's
-``main_speech.py`` address when the vehicle host is different from the laptop.
-"""
+"""Vehicle controller whose PC peer owns browser audio playback."""
 
 from __future__ import annotations
 
@@ -12,30 +8,16 @@ import threading
 import time
 
 import ws_car_control_V1_2 as base
-from hand_card_state_machine.audio_dispatcher import play_audio_blocking
 
 
 class VoiceCarController(base.CarController):
-    """Preserve the V1_2 route logic while blocking at spoken interaction points."""
-
-    def _play_prompt(self, audio_id: int, context: str) -> bool:
-        print(f"[AUDIO] {context}: playing prompt {audio_id}.")
-        try:
-            played = play_audio_blocking(audio_id)
-        except (FileNotFoundError, ValueError) as error:
-            print(f"[AUDIO WARNING] {error}")
-            return False
-
-        if not played:
-            print("[AUDIO WARNING] Playback failed or timed out; continuing safely.")
-        return played
+    """Preserve the V1_2 route logic; the PC plays every arrival prompt once."""
 
     def detect_and_handle_student(self, branch_x: int, current_y: int) -> None:
         """Perform the delivery loop with speech before each relevant wait."""
         print(" -> [流程触发] 启动超声波循迹探路...")
         self.go_detect_obstacle()
         self.pos_x = branch_x
-        self._play_prompt(1, "Student reached")
         base.send_status_to_pc("arrived_student")
 
         self.wait_for_signal(["go_teacher"])
@@ -53,10 +35,12 @@ class VoiceCarController(base.CarController):
         self.turn_to(base.WEST)
         self.execute_cmd("TF")
         self.pos_x = -1
-        self._play_prompt(4, "Teacher reached")
         base.send_status_to_pc("arrived_teacher")
 
-        self.wait_for_signal(["return_student"])
+        self.wait_for_signal(
+            ["return_student"],
+            button_arm_signal="arm_loading_button",
+        )
 
         print(" -> [连续重返现场] 正在从起点连续开回主路并直达交叉口...")
         self.execute_cmd("PU")
@@ -70,10 +54,12 @@ class VoiceCarController(base.CarController):
         print(" -> [前行至现场] 重新驶入侧边栏靠近障碍物点...")
         self.go_detect_obstacle()
         self.pos_x = branch_x
-        self._play_prompt(5, "Student return reached")
         base.send_status_to_pc("arrived_student")
 
-        self.wait_for_signal(["return_patrol"])
+        self.wait_for_signal(
+            ["return_patrol"],
+            button_arm_signal="arm_unload_button",
+        )
 
         print(" -> [姿态补偿] 线上180度掉头并退回交叉口...")
         self.execute_cmd("PN")
