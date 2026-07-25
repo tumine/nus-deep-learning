@@ -531,6 +531,9 @@ def main(speech_detector=None):
                 if hasattr(card_detector, "reset_session"):
                     card_detector.reset_session()
 
+                print("[AUDIO] Robot arrived at student; playing request prompt.")
+                play_audio_with_feedback(1, ui_manager)
+
                 speech_detector.clear()
                 speech_detector.enable()
 
