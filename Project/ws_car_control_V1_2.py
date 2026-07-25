@@ -54,7 +54,25 @@ def tcp_server_listener(hw):
 
     server_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     server_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-    server_socket.bind((HOST, PORT))
+    # Linux 下额外设置 SO_REUSEPORT，允许多个 socket 绑定同一端口
+    try:
+        server_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEPORT, 1)
+    except (AttributeError, OSError):
+        pass  # 非 Linux 或不支持则忽略
+
+    # 绑定重试：如果端口被占用，最多重试 5 次
+    max_retries = 5
+    for attempt in range(max_retries):
+        try:
+            server_socket.bind((HOST, PORT))
+            break
+        except OSError:
+            if attempt < max_retries - 1:
+                print(f"⚠️  端口 {PORT} 被占用，2 秒后重试 ({attempt + 1}/{max_retries})...")
+                time.sleep(2)
+            else:
+                raise
+
     server_socket.listen(1)
     print(f"\n📡 [网络通信] TCP 服务端已启动，正在端口 {PORT} 等待电脑端连接...")
 
