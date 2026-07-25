@@ -7,6 +7,8 @@ import json
 import mimetypes
 import os
 import threading
+import time
+import uuid
 from pathlib import Path
 from urllib import error as urlerror
 from urllib import request
@@ -41,6 +43,8 @@ class AudioDispatcher:
         self._lock = threading.Lock()
 
     def play_audio_blocking(self, audio_id: int) -> bool:
+        request_started = time.monotonic()
+        trace_id = uuid.uuid4().hex[:8]
         try:
             filename = AUDIO_FILES[audio_id]
         except KeyError as error:
@@ -52,11 +56,18 @@ class AudioDispatcher:
                 f"Audio ID {audio_id} is mapped to a missing file: {audio_path}"
             )
 
+        audio_bytes = audio_path.read_bytes()
+        print(
+            f"[AUDIO {trace_id}] Preparing audio {audio_id} ({audio_path.name}, "
+            f"{len(audio_bytes)} bytes) for {self.server_url}; "
+            f"HTTP timeout={self.timeout_seconds:.1f}s."
+        )
         payload = {
             "audio_id": audio_id,
             "filename": audio_path.name,
             "media_type": mimetypes.guess_type(audio_path.name)[0] or "audio/mp4",
-            "audio_base64": base64.b64encode(audio_path.read_bytes()).decode("ascii"),
+            "audio_base64": base64.b64encode(audio_bytes).decode("ascii"),
+            "trace_id": trace_id,
         }
         http_request = request.Request(
             self.server_url,
@@ -67,16 +78,35 @@ class AudioDispatcher:
 
         with self._lock:
             try:
+                print(f"[AUDIO {trace_id}] POST /api/audio started.")
                 with request.urlopen(http_request, timeout=self.timeout_seconds) as response:
                     result = json.loads(response.read().decode("utf-8"))
-                    return bool(result.get("played"))
+                    played = bool(result.get("played"))
+                    elapsed = time.monotonic() - request_started
+                    print(
+                        f"[AUDIO {trace_id}] Audio server replied HTTP {response.status} "
+                        f"after {elapsed:.2f}s; played={played}."
+                    )
+                    return played
             except urlerror.HTTPError as response_error:
                 detail = response_error.read().decode("utf-8", errors="replace")
-                print(f"[AUDIO] Playback rejected ({response_error.code}): {detail}")
+                elapsed = time.monotonic() - request_started
+                print(
+                    f"[AUDIO {trace_id}] Playback rejected with HTTP "
+                    f"{response_error.code} after {elapsed:.2f}s: {detail}"
+                )
             except urlerror.URLError as network_error:
-                print(f"[AUDIO] Cannot reach audio server: {network_error.reason}")
+                elapsed = time.monotonic() - request_started
+                print(
+                    f"[AUDIO {trace_id}] Cannot reach audio server after "
+                    f"{elapsed:.2f}s ({self.server_url}): {network_error.reason}"
+                )
             except TimeoutError:
-                print("[AUDIO] Timed out waiting for browser playback.")
+                elapsed = time.monotonic() - request_started
+                print(
+                    f"[AUDIO {trace_id}] Timed out after {elapsed:.2f}s "
+                    "while waiting for the audio server response."
+                )
         return False
 
 
