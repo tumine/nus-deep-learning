@@ -320,12 +320,23 @@ class UIServer:
         self.app = FastAPI()
         self.active_connections: list[WebSocket] = []
         self.audio_enabled_connections: list[WebSocket] = []
+        self._audio_playback_waiters: dict[str, asyncio.Future[bool]] = {}
         self._register_routes()
 
     def _get_audio_connection(self) -> WebSocket | None:
         for connection in reversed(self.audio_enabled_connections):
             if connection in self.active_connections:
                 return connection
+        return None
+
+    async def _wait_for_audio_connection(self) -> WebSocket | None:
+        """Allow a briefly disconnected phone UI to reconnect and re-enable audio."""
+        deadline = asyncio.get_running_loop().time() + 5.0
+        while asyncio.get_running_loop().time() < deadline:
+            connection = self._get_audio_connection()
+            if connection is not None:
+                return connection
+            await asyncio.sleep(0.1)
         return None
 
     def _register_routes(self) -> None:
@@ -335,7 +346,7 @@ class UIServer:
 
         @self.app.post("/api/audio")
         async def play_audio(audio_payload: dict[str, Any]) -> dict[str, bool]:
-            audio_connection = self._get_audio_connection()
+            audio_connection = await self._wait_for_audio_connection()
 
             if audio_connection is None:
                 raise HTTPException(
@@ -344,6 +355,8 @@ class UIServer:
                 )
 
             request_id = str(uuid.uuid4())
+            completion = asyncio.get_running_loop().create_future()
+            self._audio_playback_waiters[request_id] = completion
             try:
                 await audio_connection.send_json(
                     {
@@ -356,6 +369,7 @@ class UIServer:
                     }
                 )
             except Exception as error:
+                self._audio_playback_waiters.pop(request_id, None)
                 if audio_connection in self.audio_enabled_connections:
                     self.audio_enabled_connections.remove(audio_connection)
                 raise HTTPException(
@@ -363,7 +377,14 @@ class UIServer:
                     detail="Phone audio connection is unavailable.",
                 ) from error
 
-            return {"accepted": True}
+            try:
+                played = await asyncio.wait_for(completion, timeout=15.0)
+            except TimeoutError:
+                played = False
+            finally:
+                self._audio_playback_waiters.pop(request_id, None)
+
+            return {"played": played}
 
         @self.app.websocket("/ws")
         async def websocket_endpoint(websocket: WebSocket) -> None:
@@ -392,6 +413,12 @@ class UIServer:
                     elif message.get("type") == "enable_audio":
                         if websocket not in self.audio_enabled_connections:
                             self.audio_enabled_connections.append(websocket)
+                    elif message.get("type") == "audio_playback_complete":
+                        request_id = str(message.get("request_id", ""))
+                        completion = self._audio_playback_waiters.get(request_id)
+                        if completion is not None and not completion.done():
+                            completion.set_result(bool(message.get("played")))
+
             except WebSocketDisconnect:
                 pass
             finally:
