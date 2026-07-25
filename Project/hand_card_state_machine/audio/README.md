@@ -10,4 +10,7 @@ Place these prerecorded files in this directory before running the system:
 
 The dispatcher uses this directory by default. Override it with
 `ROBOT_AUDIO_DIRECTORY`; set `ROBOT_AUDIO_SERVER_URL` when the vehicle host
-must reach the laptop through its Tailscale address.
+must reach the laptop through its Tailscale address. Prompts are dispatched in
+the background as soon as a robot operation completes, so playback does not
+block motion or recognition. The default acceptance timeout is 4 seconds;
+override it with `ROBOT_AUDIO_TIMEOUT_SECONDS` only with a value below 5.

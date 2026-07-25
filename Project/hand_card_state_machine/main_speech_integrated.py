@@ -20,7 +20,7 @@ import sys
 import time
 
 from camera import Camera
-from audio_dispatcher import play_audio_blocking
+from audio_dispatcher import play_audio_async
 from card_detector_classifier import CardDetector
 from speech_request_detector import SpeechRequestDetector
 from hand_detector import HandDetector
@@ -152,27 +152,28 @@ def handle_hand_event(hand_event, state_machine):
 
 
 def play_audio_with_feedback(audio_id, ui_manager):
-    """Play prerecorded audio in the browser and report its result."""
-    start_message = f"[AUDIO] Starting browser playback for audio {audio_id}."
+    """Dispatch prerecorded audio without delaying the robot control loop."""
+    start_message = f"[AUDIO] Dispatching browser playback for audio {audio_id}."
     print(start_message)
     ui_manager.publish("audio_playback", {"message": start_message})
 
+    def report_delivery(accepted):
+        result_message = (
+            f"[AUDIO] Browser accepted audio {audio_id}."
+            if accepted
+            else f"[AUDIO WARNING] Browser did not accept audio {audio_id}."
+        )
+        print(result_message)
+        ui_manager.publish("audio_playback", {"message": result_message})
+
     try:
-        played = play_audio_blocking(audio_id)
+        play_audio_async(audio_id, report_delivery)
     except (FileNotFoundError, ValueError) as audio_error:
         result_message = f"[AUDIO WARNING] {audio_error}"
         print(result_message)
         ui_manager.publish("audio_playback", {"message": result_message})
         return False
-
-    if played:
-        result_message = f"[AUDIO] Browser playback completed for audio {audio_id}."
-    else:
-        result_message = f"[AUDIO WARNING] Browser playback failed or timed out for audio {audio_id}."
-
-    print(result_message)
-    ui_manager.publish("audio_playback", {"message": result_message})
-    return played
+    return True
 
 
 def handle_request_event(request_event, request_manager, task_queue, state_machine, ui_manager):
@@ -564,19 +565,16 @@ def main(speech_detector=None):
             if command_sent_for_state != current_state:
                 command_sent_for_state = None
 
-            # Arrival prompts are synchronous gates. No movement, detector, or
-            # physical-button step is unlocked until the phone confirms playback.
+            # Arrival prompts are dispatched immediately and never block robot control.
             if current_state != audio_prompt_state:
                 if current_state == RobotState.WAIT_LOADING:
-                    if not play_audio_with_feedback(4, ui_manager):
-                        continue
+                    play_audio_with_feedback(4, ui_manager)
                     send_robot_command(
                         tcp_socket,
                         {"command": "arm_loading_button"},
                     )
                 elif current_state == RobotState.WAIT_UNLOAD:
-                    if not play_audio_with_feedback(5, ui_manager):
-                        continue
+                    play_audio_with_feedback(5, ui_manager)
                     send_robot_command(
                         tcp_socket,
                         {"command": "arm_unload_button"},
@@ -589,8 +587,7 @@ def main(speech_detector=None):
             # --------------------------------------------------------------
             if current_state == RobotState.WAIT_CARD and not request_session_active:
                 print("[AUDIO] Robot arrived at student; playing request prompt.")
-                if not play_audio_with_feedback(1, ui_manager):
-                    continue
+                play_audio_with_feedback(1, ui_manager)
 
                 request_accepted = False
                 request_session_active = True
