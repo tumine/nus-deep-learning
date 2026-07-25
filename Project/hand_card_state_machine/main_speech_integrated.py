@@ -17,6 +17,7 @@ import socket
 import threading
 import queue
 import sys
+import time
 
 from camera import Camera
 from audio_dispatcher import play_audio_blocking
@@ -46,6 +47,11 @@ DEFAULT_APPROACH_SECONDS = 1.5
 # 请将这里的 IP 地址改为小车连接 WiFi 后分配到的真实 IP 地址！
 ROBOT_IP = "100.84.2.68" 
 ROBOT_PORT = 9999
+
+# 摄像头容错配置
+MAX_CAMERA_FAILURES = 5       # 连续失败帧数阈值
+MAX_CAMERA_RECONNECTS = 3     # 最多重连次数
+CAMERA_RECONNECT_DELAY = 2.0  # 重连前等待秒数
 # ==============================================================================
 
 
@@ -260,18 +266,19 @@ def draw_system_status(frame, state_machine):
     return frame
 
 
-def tcp_receive_thread(sock, network_queue, ui_manager):
+def tcp_receive_thread(sock, network_queue, ui_manager, stop_event):
     """后台独立运行的网络接收线程，专门监听小车发回的状态信息"""
     buffer = ""
-    while True:
+    while not stop_event.is_set():
         try:
+            sock.settimeout(0.5)  # 每 0.5 秒检查一次 stop_event
             data = sock.recv(1024).decode('utf-8')
             if not data:
                 print("⚠️ [网络通信] 与小车的连接已断开，请检查网络！")
                 ui_manager.update_connection("pi", False)
                 network_queue.put("connection_lost")
                 break
-            
+
             buffer += data
             # 解决 TCP 粘包问题，按行拆分指令
             while '\n' in buffer:
@@ -280,6 +287,17 @@ def tcp_receive_thread(sock, network_queue, ui_manager):
                 if line:
                     print(f"\n📥 [网络通信] 接收到小车反馈状态: '{line}'")
                     network_queue.put(line)
+        except socket.timeout:
+            continue  # 超时后检查 stop_event 再循环
+        except OSError as e:
+            # 主线程关闭了 socket，这是正常的退出信号
+            if stop_event.is_set():
+                print("[网络通信] 接收线程收到关闭信号，正常退出。")
+            else:
+                print(f"❌ [网络通信] 接收数据异常退出: {e}")
+                ui_manager.update_connection("pi", False)
+                network_queue.put("connection_lost")
+            break
         except Exception as e:
             print(f"❌ [网络通信] 接收数据异常退出: {e}")
             ui_manager.update_connection("pi", False)
@@ -311,6 +329,7 @@ def main(speech_detector=None):
     tcp_socket = None
     owns_speech_detector = speech_detector is None
     network_queue = queue.Queue()
+    tcp_stop_event = threading.Event()
 
     ui_manager = UIManager()
 
@@ -333,7 +352,8 @@ def main(speech_detector=None):
         ui_manager.update_connection("pi", True)
         
         # 启动后台接收线程
-        threading.Thread(target=tcp_receive_thread, args=(tcp_socket, network_queue, ui_manager), daemon=True).start()
+        tcp_stop_event.clear()
+        threading.Thread(target=tcp_receive_thread, args=(tcp_socket, network_queue, ui_manager, tcp_stop_event), daemon=True).start()
         # === 新增：启动电脑端终端键盘输入监听线程 ===
         threading.Thread(target=pc_input_listener, args=(tcp_socket,), daemon=True).start()
 
@@ -387,6 +407,9 @@ def main(speech_detector=None):
         print("    Q: 退出程序")
         print("  ▶ 正常装载/卸载确认：优先使用小车物理按钮 button_pressed。")
         print("  ▶ 网页 UI 同时提供 Loading Complete / Unloading Complete 备用按钮。\n")
+
+        camera_failures = 0
+        camera_reconnects = 0
 
         while True:
             # 0. 处理网页 UI 发来的控制命令
@@ -513,8 +536,28 @@ def main(speech_detector=None):
             # 2. 读取一帧摄像头画面
             frame = camera.read()
             if frame is None:
-                print("[ERROR] Failed to read camera frame.")
-                break
+                camera_failures += 1
+                print(f"[CAMERA] 读取帧失败 ({camera_failures}/{MAX_CAMERA_FAILURES})")
+
+                if camera_failures >= MAX_CAMERA_FAILURES:
+                    if camera_reconnects < MAX_CAMERA_RECONNECTS:
+                        print(f"[CAMERA] 连续 {camera_failures} 次失败，尝试重连 "
+                              f"({camera_reconnects + 1}/{MAX_CAMERA_RECONNECTS})...")
+                        if camera.reconnect():
+                            camera_failures = 0
+                            camera_reconnects += 1
+                            continue
+                        else:
+                            camera_reconnects += 1
+                            camera_failures = 0
+                    else:
+                        print(f"[FATAL] 摄像头重连 {MAX_CAMERA_RECONNECTS} 次均失败，程序退出。")
+                        break
+                    time.sleep(CAMERA_RECONNECT_DELAY)
+                continue
+
+            # 帧读取成功，重置失败计数器
+            camera_failures = 0
 
             # 3. 核心业务状态机流转
             current_state = state_machine.get_state()
@@ -792,14 +835,21 @@ def main(speech_detector=None):
             except Exception as speech_error:
                 print(f"[SPEECH WARNING] Failed to stop cleanly: {speech_error}")
 
+        # 1. 先通知接收线程停止，避免 socket 关闭时的竞态错误
+        tcp_stop_event.set()
+
         if tcp_socket is not None:
             try:
                 print("[SAFETY] Sending stop command before shutdown...")
                 tcp_socket.sendall(b"S\n")
             except OSError:
                 pass
+
         if camera is not None:
             camera.release()
+
+        # 2. 等待接收线程退出后再关闭 socket
+        time.sleep(0.8)
         if tcp_socket is not None:
             try:
                 tcp_socket.shutdown(socket.SHUT_RDWR)
