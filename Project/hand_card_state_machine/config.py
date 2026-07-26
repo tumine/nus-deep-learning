@@ -21,7 +21,7 @@ ARUCO_DICT = cv2.aruco.DICT_4X4_50
 # YOLO object request detection
 # --------------------------------------------------
 OBJECT_MODEL_PATH = "Project/hand_card_state_machine/best.pt"
-OBJECT_CONFIDENCE = 0.75
+OBJECT_CONFIDENCE = 0.6
 
 OBJECT_IMGSZ = 224
 
