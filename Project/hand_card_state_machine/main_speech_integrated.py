@@ -52,7 +52,17 @@ ROBOT_PORT = 9999
 MAX_CAMERA_FAILURES = 5       # 连续失败帧数阈值
 MAX_CAMERA_RECONNECTS = 3     # 最多重连次数
 CAMERA_RECONNECT_DELAY = 2.0  # 重连前等待秒数
+
+# WAIT_CARD 识别顺序：
+# 1. 提示音完整播放结束；
+# 2. 仅开启语音识别；
+# 3. 若在该时间内没有识别到有效语音请求，关闭语音并启用物品识别。
+# 默认语音窗口为 3 秒，还需预留 Google 识别返回时间，因此设置为 6 秒。
+SPEECH_ONLY_TIMEOUT_SECONDS = 6.0
 # ==============================================================================
+
+# 主循环和终端急停线程共用同一个 TCP socket；加锁避免并发 sendall。
+TCP_SEND_LOCK = threading.Lock()
 
 
 def print_separator():
@@ -115,8 +125,9 @@ def send_robot_command(sock, command_dict):
     print_separator()
 
     try:
-        # 发送指令并加上换行符，对应小车端的按行解析逻辑
-        sock.sendall((cmd_str + '\n').encode('utf-8'))
+        # 主循环与终端急停线程可能同时发送，必须串行写 socket。
+        with TCP_SEND_LOCK:
+            sock.sendall((cmd_str + '\n').encode('utf-8'))
         return True
     except Exception as e:
         print(f"❌ 发送指令失败: {e}")
@@ -389,9 +400,16 @@ def main(speech_detector=None):
         request_session_active = False
         request_accepted = False
 
+        # WAIT_CARD 内部阶段：
+        # - speech: 提示音结束后，仅进行语音识别
+        # - vision: 语音超时后，关闭语音并启用物品识别
+        request_input_mode = None
+        speech_listen_started_at = None
+
         # 记录上一次发送指令时的状态，防止在同一个状态下一帧一帧疯狂重复发指令
         command_sent_for_state = None
         audio_prompt_state = None
+        robot_connection_lost = False
 
         print("\n[MAIN] 状态触发控制说明:")
         print("  ▶ 正常情况：小车通过网络自动发送触发信号，自动跳转流程。")
@@ -480,7 +498,10 @@ def main(speech_detector=None):
                         state_machine.reset()
 
                 elif net_msg == "connection_lost":
-                    print("🛑 [安全提示] 小车连接已断开。")
+                    print("🛑 [安全提示] 小车连接已断开；停止继续下发业务指令。")
+                    robot_connection_lost = True
+                    speech_detector.disable()
+                    speech_detector.clear()
 
                 elif net_msg == "intersection_reached":
                     if current_state == RobotState.PATROL:
@@ -568,19 +589,21 @@ def main(speech_detector=None):
             # physical-button step is unlocked until the phone confirms playback.
             if current_state != audio_prompt_state:
                 if current_state == RobotState.WAIT_LOADING:
-                    if not play_audio_with_feedback(4, ui_manager):
-                        continue
-                    send_robot_command(
-                        tcp_socket,
-                        {"command": "arm_loading_button"},
-                    )
+                    # 提示音失败不能把整个状态机永久卡死；仍允许物理按钮继续流程。
+                    play_audio_with_feedback(4, ui_manager)
+                    if not robot_connection_lost:
+                        send_robot_command(
+                            tcp_socket,
+                            {"command": "arm_loading_button"},
+                        )
                 elif current_state == RobotState.WAIT_UNLOAD:
-                    if not play_audio_with_feedback(5, ui_manager):
-                        continue
-                    send_robot_command(
-                        tcp_socket,
-                        {"command": "arm_unload_button"},
-                    )
+                    # 提示音失败不能把整个状态机永久卡死；仍允许物理按钮继续流程。
+                    play_audio_with_feedback(5, ui_manager)
+                    if not robot_connection_lost:
+                        send_robot_command(
+                            tcp_socket,
+                            {"command": "arm_unload_button"},
+                        )
                 audio_prompt_state = current_state
 
             # --------------------------------------------------------------
@@ -589,27 +612,39 @@ def main(speech_detector=None):
             # --------------------------------------------------------------
             if current_state == RobotState.WAIT_CARD and not request_session_active:
                 print("[AUDIO] Robot arrived at student; playing request prompt.")
-                if not play_audio_with_feedback(1, ui_manager):
-                    continue
+
+                # 必须等待提示音完整播放结束后，才开始收集语音。
+                # 这样提示音本身不会进入 3 秒语音识别窗口。
+                play_audio_with_feedback(1, ui_manager)
 
                 request_accepted = False
                 request_session_active = True
+                request_input_mode = "speech"
 
                 if hasattr(card_detector, "reset_session"):
                     card_detector.reset_session()
 
+                # 清除提示音播放期间可能残留的旧数据，然后才正式开启收音。
+                speech_detector.disable()
                 speech_detector.clear()
                 speech_detector.enable()
+                speech_listen_started_at = time.monotonic()
 
                 print_separator()
-                print("[REQUEST SESSION] Visual classification and speech are enabled.")
-                print("[REQUEST SESSION] The first valid source wins.")
+                print("[REQUEST SESSION] Prompt finished.")
+                print(
+                    "[REQUEST SESSION] Speech-only recognition enabled for "
+                    f"{SPEECH_ONLY_TIMEOUT_SECONDS:.1f} seconds."
+                )
+                print("[REQUEST SESSION] Object recognition is currently disabled.")
                 print_separator()
 
             elif current_state != RobotState.WAIT_CARD and request_session_active:
                 speech_detector.disable()
                 speech_detector.clear()
                 request_session_active = False
+                request_input_mode = None
+                speech_listen_started_at = None
 
             if current_state == RobotState.PATROL:
                 # 预留给未来拓展
@@ -622,7 +657,9 @@ def main(speech_detector=None):
                 frame = hand_detector.draw(frame)
 
             elif current_state == RobotState.APPROACH_STUDENT:
-                if command_sent_for_state is None:
+                if robot_connection_lost:
+                    pass
+                elif command_sent_for_state is None:
                     command = {
                         "command": "approach_student",
                         "route_node": state_machine.get_context_value("route_node"),
@@ -634,35 +671,53 @@ def main(speech_detector=None):
                         command_sent_for_state = current_state
 
             elif current_state == RobotState.WAIT_CARD:
-                # Both conditions are valid:
-                #   1. stable visual object classification
-                #   2. confirmed speech request
-                #
-                # The first valid result advances the state to GO_TEACHER.
+                # 严格顺序：
+                #   1. 提示音结束后，只进行语音识别；
+                #   2. 语音成功则立即接受；
+                #   3. 语音超时仍无有效请求，才关闭语音并启动物品识别。
                 if not request_accepted:
-                    speech_raw = speech_detector.poll()
-                    speech_event = None
-
-                    if speech_raw is not None:
-                        speech_event = normalize_speech_event(
-                            speech_raw,
-                            state_machine,
-                        )
-
-                    # If a speech result is already waiting, accept it without
-                    # spending another frame on classification inference.
-                    if speech_event is None:
-                        visual_events = card_detector.detect(frame)
-                    else:
-                        visual_events = []
-
                     accepted_event = None
 
-                    if speech_event is not None:
-                        accepted_event = speech_event
-                    elif visual_events:
-                        accepted_event = dict(visual_events[0])
-                        accepted_event.setdefault("source", "vision")
+                    if request_input_mode == "speech":
+                        speech_raw = speech_detector.poll()
+
+                        if speech_raw is not None:
+                            accepted_event = normalize_speech_event(
+                                speech_raw,
+                                state_machine,
+                            )
+
+                        if (
+                            accepted_event is None
+                            and speech_listen_started_at is not None
+                            and (
+                                time.monotonic() - speech_listen_started_at
+                                >= SPEECH_ONLY_TIMEOUT_SECONDS
+                            )
+                        ):
+                            print_separator()
+                            print(
+                                "[SPEECH] No valid speech request was recognized "
+                                f"within {SPEECH_ONLY_TIMEOUT_SECONDS:.1f} seconds."
+                            )
+                            print("[SPEECH] Speech recognition disabled.")
+                            print("[VISION] Object recognition fallback enabled.")
+                            print_separator()
+
+                            speech_detector.disable()
+                            speech_detector.clear()
+                            request_input_mode = "vision"
+                            speech_listen_started_at = None
+
+                            if hasattr(card_detector, "reset_session"):
+                                card_detector.reset_session()
+
+                    elif request_input_mode == "vision":
+                        visual_events = card_detector.detect(frame)
+
+                        if visual_events:
+                            accepted_event = dict(visual_events[0])
+                            accepted_event.setdefault("source", "vision")
 
                     if accepted_event is not None:
                         # Main-level lock: prevents visual and speech from
@@ -673,6 +728,8 @@ def main(speech_detector=None):
                         # request. The next student session will re-enable it.
                         speech_detector.disable()
                         speech_detector.clear()
+                        request_input_mode = None
+                        speech_listen_started_at = None
 
                         handle_request_event(
                             accepted_event,
@@ -703,7 +760,9 @@ def main(speech_detector=None):
                 frame = card_detector.draw(frame)
 
             elif current_state == RobotState.GO_TEACHER:
-                if command_sent_for_state is None:
+                if robot_connection_lost:
+                    pass
+                elif command_sent_for_state is None:
                     if not task_queue.has_task():
                         print("[WARNING] GO_TEACHER entered with empty queue.")
                         state_machine.reset()
@@ -725,7 +784,9 @@ def main(speech_detector=None):
                 pass
 
             elif current_state == RobotState.RETURN_STUDENT:
-                if command_sent_for_state is None:
+                if robot_connection_lost:
+                    pass
+                elif command_sent_for_state is None:
                     command = {
                         "command": "return_student",
                         "task": state_machine.get_task(),
@@ -742,7 +803,9 @@ def main(speech_detector=None):
                 pass
 
             elif current_state == RobotState.RETURN_PATROL:
-                if command_sent_for_state is None:
+                if robot_connection_lost:
+                    pass
+                elif command_sent_for_state is None:
                     command = {
                         "command": "return_patrol",
                         "route_node": state_machine.get_context_value("route_node"),
@@ -852,7 +915,8 @@ def main(speech_detector=None):
         if tcp_socket is not None:
             try:
                 print("[SAFETY] Sending stop command before shutdown...")
-                tcp_socket.sendall(b"S\n")
+                with TCP_SEND_LOCK:
+                    tcp_socket.sendall(b"S\n")
             except OSError:
                 pass
 
