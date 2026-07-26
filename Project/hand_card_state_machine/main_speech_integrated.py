@@ -589,8 +589,10 @@ def main(speech_detector=None):
             # --------------------------------------------------------------
             if current_state == RobotState.WAIT_CARD and not request_session_active:
                 print("[AUDIO] Robot arrived at student; playing request prompt.")
-                if not play_audio_with_feedback(1, ui_manager):
-                    continue
+                audio_ok = play_audio_with_feedback(1, ui_manager)
+                if not audio_ok:
+                    print("[AUDIO WARNING] Request prompt playback failed. "
+                          "Proceeding with visual + speech detection anyway.")
 
                 request_accepted = False
                 request_session_active = True
@@ -686,6 +688,7 @@ def main(speech_detector=None):
                         axis_x = center[0] if center else None
                         axis_y = center[1] if center else None
                         source = accepted_event.get("source", "vision")
+                        confidence = accepted_event.get("confidence")
 
                         ui_manager.update_request(
                             request_type="语音" if source == "speech" else "物品",
@@ -696,6 +699,7 @@ def main(speech_detector=None):
                             ),
                             axis_x=axis_x,
                             axis_y=axis_y,
+                            confidence=confidence,
                         )
 
                 # draw() only displays the latest classifier result and must
