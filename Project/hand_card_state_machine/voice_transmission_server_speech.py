@@ -14,8 +14,8 @@
   可选：scipy（更高质量的音频重采样）、cryptography（SSL 证书生成）
 
 使用方式：
-  python voice_transmission_server_panns.py [--port 8080] [--threshold 0.3]
-  手机通过 Tailscale 访问：https://<电脑Tailscale-IP>:8080
+  python voice_transmission_server_panns.py [--port 8081] [--threshold 0.3]
+  手机通过 Tailscale 访问：https://<电脑Tailscale-IP>:8081
   （首次访问需在浏览器中接受自签名证书警告）
 """
 
@@ -1377,7 +1377,7 @@ def main():
         """,
     )
     parser.add_argument("--host", default="0.0.0.0", help="监听地址 (默认: 0.0.0.0)")
-    parser.add_argument("--port", type=int, default=8080, help="监听端口 (默认: 8080)")
+    parser.add_argument("--port", type=int, default=8081, help="监听端口 (默认: 8081)")
     parser.add_argument("--threshold", type=float, default=DEFAULT_CRY_THRESHOLD,
                         help=f"哭声检测阈值 0~1 (默认: {DEFAULT_CRY_THRESHOLD})")
     parser.add_argument("--teacher-url", type=str, default=DEFAULT_TEACHER_URL,
