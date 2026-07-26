@@ -53,6 +53,10 @@ MAX_CAMERA_FAILURES = 5       # 连续失败帧数阈值
 MAX_CAMERA_RECONNECTS = 3     # 最多重连次数
 CAMERA_RECONNECT_DELAY = 2.0  # 重连前等待秒数
 
+# 网络断连自动重连配置
+MAX_ROBOT_RECONNECT_ATTEMPTS = 10       # 最多重连次数
+ROBOT_RECONNECT_INTERVAL_SECONDS = 3.0  # 每次重连间隔秒数
+
 # WAIT_CARD 识别顺序：
 # 1. 提示音完整播放结束；
 # 2. 仅开启语音识别；
@@ -331,6 +335,43 @@ def pc_input_listener(sock):
             break
 
 
+def reconnect_robot(ui_manager, network_queue, tcp_stop_event):
+    """尝试重新连接小车 TCP Server。
+
+    连接成功时：返回新的 socket，清空 stop_event 并重启接收线程和键盘监听线程。
+    连接失败时：返回 None。
+    """
+    print(f"\n🔄 [自动重连] 正在尝试重新连接小车 ({ROBOT_IP}:{ROBOT_PORT})...")
+    try:
+        new_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        new_sock.settimeout(5.0)
+        new_sock.connect((ROBOT_IP, ROBOT_PORT))
+        new_sock.settimeout(None)
+        print("✅ [自动重连] 成功重新连接到小车网络！")
+        ui_manager.update_connection("pi", True)
+
+        # 重启后台接收线程
+        tcp_stop_event.clear()
+        threading.Thread(
+            target=tcp_receive_thread,
+            args=(new_sock, network_queue, ui_manager, tcp_stop_event),
+            daemon=True,
+        ).start()
+
+        # 重启电脑端终端键盘输入监听线程
+        threading.Thread(
+            target=pc_input_listener,
+            args=(new_sock,),
+            daemon=True,
+        ).start()
+
+        return new_sock
+    except Exception as e:
+        print(f"❌ [自动重连] 连接失败: {e}")
+        ui_manager.update_connection("pi", False)
+        return None
+
+
 def main(speech_detector=None):
     print_separator()
     print("Starting Classroom Assistant...")
@@ -410,6 +451,11 @@ def main(speech_detector=None):
         command_sent_for_state = None
         audio_prompt_state = None
         robot_connection_lost = False
+
+        # 自动重连状态跟踪
+        reconnect_in_progress = False
+        reconnect_attempts = 0
+        last_reconnect_time = 0.0
 
         print("\n[MAIN] 状态触发控制说明:")
         print("  ▶ 正常情况：小车通过网络自动发送触发信号，自动跳转流程。")
@@ -503,6 +549,19 @@ def main(speech_detector=None):
                     speech_detector.disable()
                     speech_detector.clear()
 
+                    # 关闭旧 socket，准备自动重连
+                    if tcp_socket is not None:
+                        try:
+                            tcp_socket.close()
+                        except OSError:
+                            pass
+                        tcp_socket = None
+
+                    # 初始化自动重连状态（立即开始第一次重连）
+                    reconnect_in_progress = True
+                    reconnect_attempts = 0
+                    last_reconnect_time = 0.0
+
                 elif net_msg == "intersection_reached":
                     if current_state == RobotState.PATROL:
                         print("▶️ [自动触发] 小车已到达巡逻点，开始扫描 (PATROL -> SCAN)")
@@ -553,6 +612,35 @@ def main(speech_detector=None):
                             f"但当前状态为 {current_state.name}，"
                             "本次按键已忽略。"
                         )
+
+            # 1.5. 自动重连逻辑：断连后定时尝试重新连接小车
+            if reconnect_in_progress and robot_connection_lost:
+                now = time.monotonic()
+                if now - last_reconnect_time >= ROBOT_RECONNECT_INTERVAL_SECONDS:
+                    if reconnect_attempts >= MAX_ROBOT_RECONNECT_ATTEMPTS:
+                        print(
+                            f"❌ [自动重连] 已尝试 {MAX_ROBOT_RECONNECT_ATTEMPTS} 次，"
+                            "全部失败，停止自动重连。请手动检查网络后重启程序。"
+                        )
+                        reconnect_in_progress = False
+                    else:
+                        reconnect_attempts += 1
+                        last_reconnect_time = now
+                        print(
+                            f"[自动重连] 第 {reconnect_attempts}/"
+                            f"{MAX_ROBOT_RECONNECT_ATTEMPTS} 次尝试..."
+                        )
+                        new_sock = reconnect_robot(
+                            ui_manager, network_queue, tcp_stop_event
+                        )
+                        if new_sock is not None:
+                            tcp_socket = new_sock
+                            robot_connection_lost = False
+                            reconnect_in_progress = False
+                            command_sent_for_state = None  # 允许重新下发指令
+                            print(
+                                "✅ [自动重连] 连接已恢复，系统恢复正常运行。"
+                            )
 
             # 2. 读取一帧摄像头画面
             frame = camera.read()
@@ -936,4 +1024,4 @@ def main(speech_detector=None):
 
 
 if __name__ == "__main__":
-    main()  
+    main()
