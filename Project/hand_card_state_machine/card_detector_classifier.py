@@ -1,7 +1,7 @@
 """
-card_detector_classifier_strict.py
+card_detector_classifier.py
 
-Strict one-shot classification detector for the classroom robot.
+Priority-based classification detector for the classroom robot.
 
 Design goals:
 1. Keep the original CardDetector API:
@@ -9,14 +9,14 @@ Design goals:
        results = detector.detect(frame)
        frame = detector.draw(frame)
 2. Return only ONE confirmed request in each request session.
-3. Require consecutive stable predictions, not loose voting.
+3. Priority logic: blocks > eraser > pencil.
+   Within CONFIRM_FRAMES, any block/eraser detection wins over pencil.
 4. Never auto-unlock when the object leaves the ROI.
 5. Only main.py may start a new session by calling reset_session().
 """
 
 from __future__ import annotations
 
-from collections import deque
 from pathlib import Path
 from typing import Any
 
@@ -30,7 +30,6 @@ from config import (
     OBJECT_MODEL_PATH,
     OBJECT_CONFIDENCE,
     OBJECT_IMGSZ,
-    CLASSIFIER_MIN_AVG_CONFIDENCE,
     CLASSIFIER_FRAME_STRIDE,
     CLASSIFIER_ROI_LEFT,
     CLASSIFIER_ROI_RIGHT,
@@ -56,11 +55,13 @@ REQUEST_TO_ID = {
 
 class CardDetector:
     """
-    Strict classifier-based request detector.
+    Classifier-based request detector with priority-based window decision.
 
-    A request is confirmed only after CONFIRM_FRAMES consecutive valid
-    predictions of the same class, all above OBJECT_CONFIDENCE, and with
-    average confidence above CLASSIFIER_MIN_AVG_CONFIDENCE.
+    Within a detection window of CONFIRM_FRAMES inference frames:
+    - If any block detection occurs → result is blocks.
+    - Else if any eraser detection occurs → result is eraser.
+    - Else if any pencil detection occurs → result is pencil.
+    - If nothing valid is seen → reset the window and keep waiting.
 
     After confirmation, detect() returns [] forever until reset_session()
     is explicitly called.
@@ -81,11 +82,10 @@ class CardDetector:
 
         self.frame_index = 0
 
-        self.current_candidate: str | None = None
-        self.consecutive_count = 0
-        self.confidence_history: deque[float] = deque(
-            maxlen=CONFIRM_FRAMES
-        )
+        self.seen_eraser = False
+        self.seen_block = False
+        self.seen_pencil = False
+        self.window_count = 0
 
         self.session_locked = False
         self.confirmed_result: dict[str, Any] | None = None
@@ -107,9 +107,10 @@ class CardDetector:
         for a new student. Do not call it every frame.
         """
         self.frame_index = 0
-        self.current_candidate = None
-        self.consecutive_count = 0
-        self.confidence_history.clear()
+        self.seen_eraser = False
+        self.seen_block = False
+        self.seen_pencil = False
+        self.window_count = 0
 
         self.session_locked = False
         self.confirmed_result = None
@@ -149,29 +150,52 @@ class CardDetector:
             verbose=False,
         )[0]
 
-        if result.probs is None:
-            return None, "unknown", 0.0
+        # ---- Classification mode (best.pt) ----
+        if result.probs is not None:
+            class_id = int(result.probs.top1)
+            confidence = float(result.probs.top1conf)
+            class_name = self._normalise_class_name(
+                str(self.model.names[class_id])
+            )
 
-        class_id = int(result.probs.top1)
-        confidence = float(result.probs.top1conf)
-        class_name = self._normalise_class_name(
-            str(self.model.names[class_id])
-        )
+            request = CLASS_NAME_TO_REQUEST.get(class_name)
 
-        request = CLASS_NAME_TO_REQUEST.get(class_name)
+            if request is None:
+                return None, class_name, confidence
 
-        if request is None:
-            return None, class_name, confidence
+            if confidence < OBJECT_CONFIDENCE:
+                return None, class_name, confidence
 
-        if confidence < OBJECT_CONFIDENCE:
-            return None, class_name, confidence
+            return request, class_name, confidence
 
-        return request, class_name, confidence
+        # ---- Detection mode fallback (best-1.pt / best-2.pt) ----
+        if result.boxes is not None and len(result.boxes) > 0:
+            # Choose the detection with highest confidence
+            best_idx = int(result.boxes.conf.argmax())
+            class_id = int(result.boxes.cls[best_idx])
+            confidence = float(result.boxes.conf[best_idx])
+            class_name = self._normalise_class_name(
+                str(self.model.names[class_id])
+            )
 
-    def _reset_candidate(self) -> None:
-        self.current_candidate = None
-        self.consecutive_count = 0
-        self.confidence_history.clear()
+            request = CLASS_NAME_TO_REQUEST.get(class_name)
+
+            if request is None:
+                return None, class_name, confidence
+
+            if confidence < OBJECT_CONFIDENCE:
+                return None, class_name, confidence
+
+            return request, class_name, confidence
+
+        # Neither classification nor detection produced results
+        return None, "unknown", 0.0
+
+    def _reset_window(self) -> None:
+        self.seen_eraser = False
+        self.seen_block = False
+        self.seen_pencil = False
+        self.window_count = 0
 
     # ============================================================
     # Detect
@@ -181,10 +205,14 @@ class CardDetector:
         """
         Return one confirmed result once per session.
 
+        Within a detection window of CONFIRM_FRAMES inference frames,
+        if any eraser or block detection occurs, the result is determined
+        as eraser or block respectively. Otherwise the result is pencil.
+
         Normal frame:
             []
 
-        First stable confirmation:
+        First confirmation:
             [{... confirmed=True ...}]
 
         Every later frame in the same session:
@@ -230,78 +258,72 @@ class CardDetector:
         self.last_raw_class = class_name
         self.last_confidence = confidence
 
-        # Any invalid/low-confidence frame breaks the consecutive streak.
-        if request is None:
-            self._reset_candidate()
+        # Track which classes have been seen in this window.
+        if request is not None:
+            if request == "eraser":
+                self.seen_eraser = True
+            elif request == "blocks":
+                self.seen_block = True
+            elif request == "pencil":
+                self.seen_pencil = True
 
-            self.last_display = {
-                "id": -1,
-                "request": None,
+        self.window_count += 1
+
+        display = {
+            "id": REQUEST_TO_ID.get(request, -1),
+            "request": request,
+            "class_name": class_name,
+            "confidence": confidence,
+            "average_confidence": 0.0,
+            "center": center,
+            "corners": corners,
+            "bbox": bbox,
+            "count": self.window_count,
+            "confirmed": False,
+        }
+
+        # After the window is full, determine the result.
+        if self.window_count >= CONFIRM_FRAMES:
+            if self.seen_block:
+                final_request = "blocks"
+            elif self.seen_eraser:
+                final_request = "eraser"
+            elif self.seen_pencil:
+                final_request = "pencil"
+            else:
+                # Nothing valid was seen in this window;
+                # reset and keep waiting.
+                self._reset_window()
+                self.last_display = display
+                return []
+
+            result = {
+                "id": REQUEST_TO_ID[final_request],
+                "request": final_request,
                 "class_name": class_name,
                 "confidence": confidence,
                 "average_confidence": 0.0,
                 "center": center,
                 "corners": corners,
                 "bbox": bbox,
-                "count": 0,
-                "confirmed": False,
+                "count": self.window_count,
+                "confirmed": True,
             }
-
-            return []
-
-        # A class switch also breaks the streak completely.
-        if request != self.current_candidate:
-            self.current_candidate = request
-            self.consecutive_count = 1
-            self.confidence_history.clear()
-            self.confidence_history.append(confidence)
-        else:
-            self.consecutive_count += 1
-            self.confidence_history.append(confidence)
-
-        average_confidence = (
-            sum(self.confidence_history)
-            / len(self.confidence_history)
-        )
-
-        result = {
-            "id": REQUEST_TO_ID[request],
-            "request": request,
-            "class_name": class_name,
-            "confidence": confidence,
-            "average_confidence": average_confidence,
-            "center": center,
-            "corners": corners,
-            "bbox": bbox,
-            "count": self.consecutive_count,
-            "confirmed": False,
-        }
-
-        # Strict confirmation:
-        # - same class in CONFIRM_FRAMES consecutive inference frames
-        # - confidence threshold passed on every one of those frames
-        # - average confidence threshold passed
-        if (
-            self.consecutive_count >= CONFIRM_FRAMES
-            and len(self.confidence_history) == CONFIRM_FRAMES
-            and average_confidence >= CLASSIFIER_MIN_AVG_CONFIDENCE
-        ):
-            result["confirmed"] = True
 
             self.session_locked = True
             self.confirmed_result = result.copy()
             self.last_display = result.copy()
 
             print(
-                "[CardDetector] confirmed exactly once:",
-                request,
-                f"count={self.consecutive_count}",
-                f"avg={average_confidence:.3f}",
+                "[CardDetector] confirmed:", final_request,
+                f"window={self.window_count}",
+                f"eraser={self.seen_eraser} block={self.seen_block}"
+                f" pencil={self.seen_pencil}",
             )
 
             return [result.copy()]
 
-        self.last_display = result
+        self.last_display = display
         return []
 
     # ============================================================
