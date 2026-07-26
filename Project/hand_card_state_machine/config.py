@@ -18,10 +18,17 @@ FRAME_WIDTH = 1000
 ARUCO_DICT = cv2.aruco.DICT_4X4_50
 
 # --------------------------------------------------
-# YOLO object request detection
+# Classification model (TorchScript)
 # --------------------------------------------------
-OBJECT_MODEL_PATH = "Project/hand_card_state_machine/best.pt"
+OBJECT_MODEL_PATH = "Project/hand_card_state_machine/model.pt"
 OBJECT_CONFIDENCE = 0.75
+
+# 模型输出的类别名称列表，顺序必须与训练时 ImageFolder 的字母序一致
+# 如果你的模型训练时类别顺序不同，请修改此列表
+CLASS_NAMES = ["block", "eraser", "pencil"]
+
+# 输入尺寸，必须与训练时的 input_size 一致
+OBJECT_INPUT_SIZE = 224
 
 OBJECT_IMGSZ = 224
 

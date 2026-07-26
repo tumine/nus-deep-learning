@@ -21,7 +21,10 @@ from pathlib import Path
 from typing import Any
 
 import cv2
-from ultralytics import YOLO
+import numpy as np
+import torch
+from PIL import Image
+from torchvision import transforms
 
 from config import (
     BOX_COLOR,
@@ -30,6 +33,8 @@ from config import (
     OBJECT_MODEL_PATH,
     OBJECT_CONFIDENCE,
     OBJECT_IMGSZ,
+    CLASS_NAMES,
+    OBJECT_INPUT_SIZE,
     CLASSIFIER_MIN_AVG_CONFIDENCE,
     CLASSIFIER_FRAME_STRIDE,
     CLASSIFIER_ROI_LEFT,
@@ -66,6 +71,10 @@ class CardDetector:
     is explicitly called.
     """
 
+    # ImageNet 标准化参数（必须与训练时一致）
+    IMAGENET_MEAN = [0.485, 0.456, 0.406]
+    IMAGENET_STD = [0.229, 0.224, 0.225]
+
     def __init__(self) -> None:
         model_path = Path(OBJECT_MODEL_PATH)
 
@@ -74,10 +83,39 @@ class CardDetector:
                 f"Classification model not found: {model_path.resolve()}"
             )
 
-        self.model = YOLO(str(model_path))
+        # ---- 设备选择 ----
+        if CLASSIFIER_DEVICE == 0 or CLASSIFIER_DEVICE == "0":
+            self.device = torch.device(
+                "cuda:0" if torch.cuda.is_available() else "cpu"
+            )
+        elif isinstance(CLASSIFIER_DEVICE, str) and CLASSIFIER_DEVICE.lower() == "cpu":
+            self.device = torch.device("cpu")
+        else:
+            self.device = torch.device(CLASSIFIER_DEVICE)
 
-        print("[CardDetector] model:", model_path)
-        print("[CardDetector] classes:", self.model.names)
+        # ---- 使用 torch.jit.load 加载 TorchScript 模型 ----
+        self.model = torch.jit.load(str(model_path), map_location=self.device)
+        self.model.eval()
+        print(f"[CardDetector] TorchScript model loaded: {model_path}")
+        print(f"[CardDetector] device: {self.device}")
+
+        # ---- 类别名称（来自 config.py，顺序必须与训练时一致） ----
+        self.class_names: list[str] = list(CLASS_NAMES)
+        self.class_to_idx: dict[str, int] = {
+            name: i for i, name in enumerate(self.class_names)
+        }
+        print(f"[CardDetector] classes ({len(self.class_names)}): {self.class_names}")
+
+        # ---- 预处理 transform（与训练时 Resize+Crop+Normalize 一致） ----
+        self._transform = transforms.Compose([
+            transforms.Resize(int(OBJECT_INPUT_SIZE * 1.15)),
+            transforms.CenterCrop(OBJECT_INPUT_SIZE),
+            transforms.ToTensor(),
+            transforms.Normalize(
+                mean=self.IMAGENET_MEAN,
+                std=self.IMAGENET_STD,
+            ),
+        ])
 
         self.frame_index = 0
 
@@ -141,22 +179,35 @@ class CardDetector:
 
         return frame[y1:y2, x1:x2], (x1, y1, x2, y2)
 
+    def _preprocess(self, roi_bgr: np.ndarray) -> torch.Tensor:
+        """将 OpenCV BGR ROI 预处理为模型输入 tensor (1, 3, H, W)。"""
+        # BGR → RGB
+        roi_rgb = cv2.cvtColor(roi_bgr, cv2.COLOR_BGR2RGB)
+        # numpy → PIL → transform
+        image = Image.fromarray(roi_rgb)
+        tensor = self._transform(image).unsqueeze(0)  # (1, 3, H, W)
+        return tensor.to(self.device)
+
     def _predict(self, roi) -> tuple[str | None, str, float]:
-        result = self.model.predict(
-            source=roi,
-            imgsz=OBJECT_IMGSZ,
-            device=CLASSIFIER_DEVICE,
-            verbose=False,
-        )[0]
+        # 预处理
+        input_tensor = self._preprocess(roi)
 
-        if result.probs is None:
-            return None, "unknown", 0.0
+        # 推理
+        with torch.no_grad():
+            logits = self.model(input_tensor)
 
-        class_id = int(result.probs.top1)
-        confidence = float(result.probs.top1conf)
-        class_name = self._normalise_class_name(
-            str(self.model.names[class_id])
-        )
+        # softmax → 概率
+        probs = torch.softmax(logits, dim=1).cpu().numpy()[0]
+
+        class_id = int(np.argmax(probs))
+        confidence = float(probs[class_id])
+
+        if 0 <= class_id < len(self.class_names):
+            class_name = self._normalise_class_name(
+                str(self.class_names[class_id])
+            )
+        else:
+            return None, "unknown", confidence
 
         request = CLASS_NAME_TO_REQUEST.get(class_name)
 
