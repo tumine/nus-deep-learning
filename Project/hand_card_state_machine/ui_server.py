@@ -15,6 +15,7 @@ import threading
 import time
 import uuid
 import webbrowser
+from pathlib import Path
 from typing import Any
 
 import uvicorn
@@ -22,6 +23,7 @@ from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect
 from fastapi.responses import HTMLResponse
 
 from ui_manager import UIManager
+from voice_transmission import VoiceTransmissionManager
 
 
 def _configure_firewall(port: int) -> None:
@@ -61,6 +63,147 @@ def _configure_firewall(port: int) -> None:
         )
 
 
+def _generate_ssl_cert_paths() -> tuple[str | None, str | None]:
+    """Generate a self-signed SSL certificate for HTTPS support.
+
+    Mobile browsers require HTTPS for ``getUserMedia`` (microphone access).
+    This function tries openssl first, then falls back to the ``cryptography``
+    library.  Certificates are cached in ``~/.voice_transmission_server/``.
+
+    Returns:
+        ``(cert_path, key_path)`` or ``(None, None)`` if generation fails.
+    """
+    cert_dir = Path.home() / ".voice_transmission_server"
+    cert_path = cert_dir / "cert.pem"
+    key_path = cert_dir / "key.pem"
+
+    if cert_path.exists() and key_path.exists():
+        print(f"[SSL] Using existing certificate: {cert_path}")
+        return str(cert_path), str(key_path)
+
+    cert_dir.mkdir(parents=True, exist_ok=True)
+
+    # ---- Method 1: openssl ------------------------------------------
+    try:
+        subprocess.run(
+            [
+                "openssl", "req", "-x509", "-newkey", "rsa:2048",
+                "-keyout", str(key_path), "-out", str(cert_path),
+                "-days", "3650", "-nodes",
+                "-subj", "/CN=RobotControlCenter",
+            ],
+            capture_output=True, check=True, timeout=30,
+        )
+        print(f"[SSL] Certificate generated (openssl): {cert_path}")
+        return str(cert_path), str(key_path)
+    except (FileNotFoundError, subprocess.CalledProcessError,
+            subprocess.TimeoutExpired):
+        pass
+
+    # ---- Method 2: cryptography library -----------------------------
+    try:
+        from cryptography import x509
+        from cryptography.x509.oid import NameOID
+        from cryptography.hazmat.primitives import hashes, serialization
+        from cryptography.hazmat.primitives.asymmetric import rsa
+        import datetime as dt
+
+        key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+        subject = issuer = x509.Name([
+            x509.NameAttribute(NameOID.COMMON_NAME, "RobotControlCenter"),
+        ])
+        cert = (
+            x509.CertificateBuilder()
+            .subject_name(subject)
+            .issuer_name(issuer)
+            .public_key(key.public_key())
+            .serial_number(x509.random_serial_number())
+            .not_valid_before(dt.datetime.utcnow())
+            .not_valid_after(
+                dt.datetime.utcnow() + dt.timedelta(days=3650)
+            )
+            .sign(key, hashes.SHA256())
+        )
+        key_path.write_bytes(key.private_bytes(
+            encoding=serialization.Encoding.PEM,
+            format=serialization.PrivateFormat.TraditionalOpenSSL,
+            encryption_algorithm=serialization.NoEncryption(),
+        ))
+        cert_path.write_bytes(cert.public_bytes(serialization.Encoding.PEM))
+        print(f"[SSL] Certificate generated (cryptography): {cert_path}")
+        return str(cert_path), str(key_path)
+    except ImportError:
+        pass
+
+    # ---- No SSL available -------------------------------------------
+    print(
+        "[SSL WARNING] Cannot generate SSL certificate "
+        "(openssl and cryptography not available)."
+    )
+    print(
+        "[SSL WARNING] Mobile browsers will NOT be able to access "
+        "the microphone — HTTPS is required for getUserMedia()."
+    )
+    return None, None
+
+
+def _detect_ips() -> tuple[str | None, list[str]]:
+    """Detect local network IPs, distinguishing Tailscale (100.64.0.0/10)
+    from LAN addresses.
+
+    Returns:
+        ``(tailscale_ip, lan_ips)``
+    """
+    import socket as _socket
+
+    all_ips: list[str] = []
+
+    # Method 1: psutil (most reliable, no DNS)
+    try:
+        import psutil
+        for addrs in psutil.net_if_addrs().values():
+            for addr in addrs:
+                if (
+                    addr.family == _socket.AF_INET
+                    and not addr.address.startswith("127.")
+                ):
+                    all_ips.append(addr.address)
+    except (ImportError, Exception):
+        pass
+
+    # Method 2: UDP connect probe
+    for probe in ("100.64.0.1", "8.8.8.8"):
+        try:
+            with _socket.socket(_socket.AF_INET, _socket.SOCK_DGRAM) as s:
+                s.settimeout(1)
+                s.connect((probe, 80))
+                ip = s.getsockname()[0]
+                if ip and not ip.startswith("127."):
+                    all_ips.append(ip)
+        except OSError:
+            pass
+
+    # Deduplicate
+    seen: set[str] = set()
+    unique = [ip for ip in all_ips if not (ip in seen or seen.add(ip))]  # type: ignore[func-returns-value]
+
+    # Classify
+    tailscale_ip: str | None = None
+    lan_ips: list[str] = []
+    for ip in unique:
+        parts = ip.split(".")
+        if (
+            len(parts) == 4
+            and ip.startswith("100.")
+            and 64 <= int(parts[1]) <= 127
+        ):
+            tailscale_ip = ip
+        else:
+            lan_ips.append(ip)
+
+    return tailscale_ip, lan_ips
+
+
 HTML_PAGE = r"""
 <!DOCTYPE html>
 <html lang="zh-CN">
@@ -87,6 +230,8 @@ th{background:#f8fafc;position:sticky;top:0}.table-wrap{max-height:470px;overflo
 button{border:0;border-radius:11px;padding:14px;font-weight:700;cursor:pointer;font-size:.95rem}
 .stop{background:#dc2626;color:white}.stop:hover{background:#b91c1c}
 .audio{background:#7c3aed;color:white}.audio:hover:not(:disabled){background:#6d28d9}
+.mic{background:#059669;color:white}.mic:hover:not(:disabled){background:#047857}
+.mic.active{background:#dc2626;color:white}.mic.active:hover:not(:disabled){background:#b91c1c}
 .load{background:#2563eb;color:white}.load:hover:not(:disabled){background:#1d4ed8}
 .unload{background:#16a34a;color:white}.unload:hover:not(:disabled){background:#15803d}
 button:disabled{background:#cbd5e1;color:#64748b;cursor:not-allowed;opacity:.72}
@@ -131,6 +276,14 @@ button:disabled{background:#cbd5e1;color:#64748b;cursor:not-allowed;opacity:.72}
             🔊 Enable Phone Audio
           </button>
 
+          <button
+            class="mic"
+            id="micButton"
+            onclick="toggleMicrophone()"
+          >
+            🎤 Start Microphone
+          </button>
+
           <button class="stop" onclick="sendCommand('STOP')">
             🛑 EMERGENCY STOP
           </button>
@@ -168,6 +321,7 @@ let socket = null;
 let requests = [];
 let phoneAudioEnabled = false;
 let audioContext = null;
+let micPc = null, micStream = null, micActive = false;
 const reconnectDelayMilliseconds = 500;
 
 function log(text){
@@ -291,7 +445,8 @@ function handleMessage(message){
     requests.push(data);
     document.getElementById("currentRequest").textContent=data.description||"-";
     renderRequests();
-    log(`New request: ${data.description||"-"}`);
+    const confStr=data.confidence!=null?` (confidence: ${(data.confidence*100).toFixed(1)}%)`:"";
+    log(`New request: ${data.description||"-"}${confStr}`);
   }else if(type==="audio_playback"){
     log(data.message||"Audio playback update.");
   }else if(type==="play_audio"){
@@ -301,6 +456,17 @@ function handleMessage(message){
     }else{
       reportAudioPlayback(data.request_id,false);
       log("Audio playback ignored until phone audio is enabled.");
+    }
+  }else if(type==="mic_status"){
+    const isActive=!!(data&&data.active);
+    if(isActive!==micActive){
+      micActive=isActive;
+      updateMicButton();
+      if(isActive){
+        log("Microphone transmission active ("+(data.elapsed_seconds||0)+"s).");
+      }else{
+        log("Microphone transmission stopped.");
+      }
     }
   }
 }
@@ -342,6 +508,124 @@ function sendCommand(command){
   socket.send(JSON.stringify({type:"control_command",command}));
   log(`Command sent: ${command}`);
 }
+
+// ============================================================
+//  WebRTC Microphone Transmission
+// ============================================================
+
+function updateMicButton(){
+  const btn=document.getElementById("micButton");
+  if(micActive){
+    btn.textContent="🔴 Stop Microphone";
+    btn.className="mic active";
+  }else{
+    btn.textContent="🎤 Start Microphone";
+    btn.className="mic";
+  }
+}
+
+function stopLocalMicrophone(){
+  if(micPc){micPc.close();micPc=null;}
+  if(micStream){micStream.getTracks().forEach(t=>t.stop());micStream=null;}
+  micActive=false;
+  updateMicButton();
+}
+
+async function toggleMicrophone(){
+  if(micActive){
+    await stopMicrophone();
+  }else{
+    await startMicrophone();
+  }
+}
+
+async function startMicrophone(){
+  const btn=document.getElementById("micButton");
+  btn.disabled=true;
+  btn.textContent="⏳ Connecting...";
+
+  try{
+    if(!navigator.mediaDevices||!navigator.mediaDevices.getUserMedia){
+      throw new Error("Browser does not support microphone access. Use HTTPS.");
+    }
+
+    micStream=await navigator.mediaDevices.getUserMedia({
+      audio:{echoCancellation:true,noiseSuppression:true,autoGainControl:true}
+    });
+    log("Microphone access granted.");
+
+    micPc=new RTCPeerConnection({
+      iceServers:[
+        {urls:"stun:stun.l.google.com:19302"},
+        {urls:"stun:stun.qq.com:3478"},
+      ]
+    });
+
+    micPc.onconnectionstatechange=()=>{
+      const state=micPc&&micPc.connectionState;
+      if(state==="connected"){
+        micActive=true;
+        updateMicButton();
+        btn.disabled=false;
+        log("Microphone streaming active.");
+      }else if(["failed","disconnected","closed"].includes(state||"")){
+        stopLocalMicrophone();
+        log("Microphone connection lost: "+state,"cry");
+      }
+    };
+
+    micStream.getTracks().forEach(t=>micPc.addTrack(t,micStream));
+
+    const offer=await micPc.createOffer();
+    await micPc.setLocalDescription(offer);
+
+    // Wait for ICE gathering (with timeout)
+    await Promise.race([
+      new Promise(resolve=>{
+        if(micPc.iceGatheringState==="complete") return resolve();
+        micPc.addEventListener("icegatheringstatechange",()=>{
+          if(micPc.iceGatheringState==="complete") resolve();
+        });
+      }),
+      new Promise(resolve=>setTimeout(()=>{
+        log("ICE gathering timeout, proceeding with available candidates.");
+        resolve();
+      },8000))
+    ]);
+
+    const resp=await fetch("/webrtc/offer",{
+      method:"POST",
+      headers:{"Content-Type":"application/json"},
+      body:JSON.stringify({
+        sdp:micPc.localDescription.sdp,
+        type:micPc.localDescription.type
+      })
+    });
+
+    if(!resp.ok){
+      const errData=await resp.json().catch(()=>({}));
+      throw new Error(errData.detail||"Server returned "+resp.status);
+    }
+
+    const answer=await resp.json();
+    await micPc.setRemoteDescription(new RTCSessionDescription(answer));
+    log("WebRTC signaling completed.");
+
+  }catch(err){
+    log("Microphone error: "+err.message);
+    stopLocalMicrophone();
+    btn.disabled=false;
+    updateMicButton();
+  }
+}
+
+async function stopMicrophone(){
+  try{
+    await fetch("/webrtc/stop",{method:"POST"});
+  }catch(e){}
+  stopLocalMicrophone();
+  log("Microphone transmission stopped.");
+}
 connect();
 </script>
 </body>
@@ -358,11 +642,19 @@ class UIServer:
         host: str = "0.0.0.0",
         port: int = 8000,
         open_browser: bool = True,
+        voice_transmission_manager: VoiceTransmissionManager | None = None,
     ) -> None:
         self.ui_manager = ui_manager
         self.host = host
         self.port = port
         self.open_browser = open_browser
+        self.voice_manager = voice_transmission_manager
+
+        # Generate self-signed SSL certificate so mobile browsers can
+        # access the microphone (getUserMedia requires HTTPS).
+        self._ssl_certfile, self._ssl_keyfile = _generate_ssl_cert_paths()
+        self._use_https = self._ssl_certfile is not None
+
         self.app = FastAPI()
         self.active_connections: list[WebSocket] = []
         self.audio_enabled_connections: list[WebSocket] = []
@@ -468,6 +760,66 @@ class UIServer:
             )
             return {"played": played}
 
+        @self.app.post("/webrtc/offer")
+        async def webrtc_offer(payload: dict[str, Any]) -> dict[str, str]:
+            """Handle WebRTC offer from the browser microphone.
+
+            The browser sends its local SDP; the server creates a peer
+            connection, sets up audio track handling, and returns an answer.
+            """
+            if self.voice_manager is None:
+                raise HTTPException(
+                    status_code=503,
+                    detail="Microphone transmission is not available.",
+                )
+
+            try:
+                answer = await self.voice_manager.handle_offer(
+                    str(payload.get("sdp", "")),
+                    str(payload.get("type", "offer")),
+                )
+            except RuntimeError as exc:
+                raise HTTPException(status_code=503, detail=str(exc)) from exc
+            except Exception as exc:
+                raise HTTPException(
+                    status_code=500, detail=f"WebRTC error: {exc}"
+                ) from exc
+
+            # Broadcast mic status to all connected browsers
+            mic_status = self.voice_manager.get_status()
+            for conn in list(self.active_connections):
+                try:
+                    await conn.send_json(
+                        {
+                            "type": "mic_status",
+                            "data": mic_status,
+                        }
+                    )
+                except Exception:
+                    pass
+
+            return answer
+
+        @self.app.post("/webrtc/stop")
+        async def webrtc_stop() -> dict[str, str]:
+            """Stop the current microphone transmission."""
+            if self.voice_manager is not None:
+                await self.voice_manager.stop()
+
+            # Broadcast stopped status
+            for conn in list(self.active_connections):
+                try:
+                    await conn.send_json(
+                        {
+                            "type": "mic_status",
+                            "data": {"active": False},
+                        }
+                    )
+                except Exception:
+                    pass
+
+            return {"status": "stopped"}
+
         @self.app.websocket("/ws")
         async def websocket_endpoint(websocket: WebSocket) -> None:
             await websocket.accept()
@@ -543,16 +895,47 @@ class UIServer:
     def run(self) -> None:
         if self.host in ("0.0.0.0", ""):
             _configure_firewall(self.port)
+
+        protocol = "https" if self._use_https else "http"
+
         if self.open_browser:
             threading.Timer(
                 1.0,
-                lambda: webbrowser.open(f"http://127.0.0.1:{self.port}"),
+                lambda: webbrowser.open(
+                    f"{protocol}://127.0.0.1:{self.port}"
+                ),
             ).start()
+
+        # Print access URLs for mobile / LAN use (mirrors the panns
+        # server startup banner so users know the exact address).
+        try:
+            tailscale_ip, lan_ips = _detect_ips()
+        except Exception:
+            tailscale_ip, lan_ips = None, []
+
+        print("\n" + "=" * 60)
+        print("  Robot Control Center")
+        print("=" * 60)
+        print(f"\n  Local:   {protocol}://127.0.0.1:{self.port}")
+        if tailscale_ip:
+            print(f"  Tailscale: {protocol}://{tailscale_ip}:{self.port}"
+                  "  <-- phone use this")
+        for ip in lan_ips:
+            print(f"  LAN:     {protocol}://{ip}:{self.port}")
+        if self._use_https:
+            print(f"\n  HTTPS enabled (self-signed certificate)")
+            print(f"  First visit: accept the certificate warning in browser")
+        else:
+            print(f"\n  HTTP only — phone microphone requires HTTPS!")
+            print(f"  Install: pip install cryptography  (or openssl)")
+        print("=" * 60 + "\n")
 
         uvicorn.run(
             self.app,
             host=self.host,
             port=self.port,
+            ssl_keyfile=self._ssl_keyfile,
+            ssl_certfile=self._ssl_certfile,
             log_level="info",
         )
 

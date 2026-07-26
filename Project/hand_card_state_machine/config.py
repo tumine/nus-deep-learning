@@ -20,10 +20,10 @@ ARUCO_DICT = cv2.aruco.DICT_4X4_50
 # --------------------------------------------------
 # YOLO object request detection
 # --------------------------------------------------
-OBJECT_MODEL_PATH = "Project/hand_card_state_machine/best.pt"
-OBJECT_CONFIDENCE = 0.6
+OBJECT_MODEL_PATH = "Project/hand_card_state_machine/best-2.pt"
+OBJECT_CONFIDENCE = 0.6 
 
-OBJECT_IMGSZ = 224
+OBJECT_IMGSZ = 800
 
 CLASSIFIER_WINDOW_SIZE = 10
 CLASSIFIER_MIN_AVG_CONFIDENCE = 0.80
@@ -34,11 +34,11 @@ CLASSIFIER_FRAME_STRIDE = 1
 # 连续多少帧没有可靠目标后，允许同一物品再次触发
 CLASSIFIER_RELEASE_FRAMES = 5
 
-# 中央 ROI
-CLASSIFIER_ROI_LEFT = 0.25
-CLASSIFIER_ROI_RIGHT = 0.75
-CLASSIFIER_ROI_TOP = 0.20
-CLASSIFIER_ROI_BOTTOM = 0.85
+# 中央 ROI（全帧，不做裁剪）
+CLASSIFIER_ROI_LEFT = 0.0
+CLASSIFIER_ROI_RIGHT = 1.0
+CLASSIFIER_ROI_TOP = 0.0
+CLASSIFIER_ROI_BOTTOM = 1.0
 
 CLASSIFIER_DEVICE = 0
 
@@ -47,7 +47,7 @@ SHOW_CLASSIFIER_DEBUG = True
 # --------------------------------------------------
 # Multi-frame confirmation
 # --------------------------------------------------
-CONFIRM_FRAMES = 7
+CONFIRM_FRAMES = 15
 
 # --------------------------------------------------
 # Drawing

@@ -40,7 +40,7 @@ def parse_args() -> argparse.Namespace:
         description="Run robot main with iPhone WebRTC speech input."
     )
     parser.add_argument("--host", default="0.0.0.0")
-    parser.add_argument("--voice-port", type=int, default=8080)
+    parser.add_argument("--voice-port", type=int, default=8081)
     return parser.parse_args()
 
 

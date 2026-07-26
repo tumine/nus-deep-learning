@@ -1,21 +1,23 @@
 """
-test_video_classification.py
+stream_video_classification.py
 
-通过电脑摄像头实时流式检测 YOLO 模型的视频分类/检测能力。
+通过 HTTP MJPEG 视频流实时显示画面并叠加 YOLO 模型的检测/分类结果。
 
-与 CardDetector（单次截图分类 + 会话锁定）不同，本脚本：
-- 对摄像头每一帧持续进行推理，不做会话锁定
+与 test_video_classification.py（使用本地摄像头）不同，本脚本：
+- 从 http://100.84.2.68:5000/video_feed 拉取远端视频流
+- 对每一帧持续进行 YOLO 推理
 - 检测模式（有 boxes）：在画面中画出目标边界框和标签
 - 分类模式（只有 probs）：在画面中央显示 top-N 分类结果
 - 显示实时 FPS，验证流式推理性能
+- 支持断线自动重连
 
 用法：
-    python test_video_classification.py
+    python stream_video_classification.py
 
 按键：
     Q / ESC  → 退出
     M        → 切换 detection / classification 模式
-    D        → 切换调试信息
+    D        → 切换调试信息（HUD）
     S        → 截图保存
 """
 
@@ -43,7 +45,6 @@ def _check_opencv_gui_available():
     """检测 OpenCV 是否具备 GUI 支持（非 headless 版本）。"""
     import numpy as np
     try:
-        # 仅检测函数是否存在 — headless 版中 imshow 存在但运行时失败
         dummy = np.zeros((10, 10, 3), dtype=np.uint8)
         cv2.imshow("_probe_", dummy)
         cv2.destroyWindow("_probe_")
@@ -71,6 +72,20 @@ from config import (
     OBJECT_CONFIDENCE,
     OBJECT_IMGSZ,
 )
+
+
+# ================================================================
+# 配置
+# ================================================================
+STREAM_URL = "http://100.84.2.68:5000/video_feed"
+
+# 每隔多少帧做一次推理（1 = 每帧，2 = 隔一帧，可提高流畅度）
+FRAME_STRIDE = 1
+
+# 重连最大尝试次数
+MAX_RECONNECT_ATTEMPTS = 10
+# 重连间隔（秒）
+RECONNECT_DELAY = 2.0
 
 
 # ---- 绘制颜色 ----
@@ -105,9 +120,6 @@ def filter_overlapping_by_priority(boxes_result, class_names, iou_threshold=0.3)
     对重叠位置上的 pencil / eraser / block 检测框进行优先级过滤。
 
     优先级：block > eraser > pencil
-    当这三类中的任意两类在相近位置（IoU >= iou_threshold）被同时检出时，
-    只保留优先级最高的框，丢弃其他类型的框。
-
     返回: 需要丢弃的框索引集合（skip_set）。
     """
     if boxes_result is None or boxes_result.boxes is None:
@@ -118,7 +130,6 @@ def filter_overlapping_by_priority(boxes_result, class_names, iou_threshold=0.3)
     if n == 0:
         return set()
 
-    # ---- 建立优先级映射：class_id -> priority (3=block, 2=eraser, 1=pencil)
     priority_map: dict[int, int] = {}
     for cls_id, cls_name in class_names.items():
         cls_id = int(cls_id)
@@ -131,7 +142,7 @@ def filter_overlapping_by_priority(boxes_result, class_names, iou_threshold=0.3)
             priority_map[cls_id] = 1
 
     if not priority_map:
-        return set()  # 模型不包含这三类，无需过滤
+        return set()
 
     xyxy = boxes.xyxy.cpu().numpy()
     cls_ids = [int(boxes.cls[i]) for i in range(n)]
@@ -142,7 +153,7 @@ def filter_overlapping_by_priority(boxes_result, class_names, iou_threshold=0.3)
         if i in remove_indices:
             continue
         if cls_ids[i] not in priority_map:
-            continue  # 非优先级类别，不参与过滤
+            continue
 
         for j in range(i + 1, n):
             if j in remove_indices:
@@ -158,7 +169,7 @@ def filter_overlapping_by_priority(boxes_result, class_names, iou_threshold=0.3)
                     remove_indices.add(j)
                 else:
                     remove_indices.add(i)
-                    break  # i 已被标记移除，无需继续比较后续 j
+                    break
 
     return remove_indices
 
@@ -244,13 +255,13 @@ def draw_classification_overlay(frame, probs_result, class_names, top_n=5):
     return frame
 
 
-def draw_hud(frame, fps, mode, model_name):
+def draw_hud(frame, fps, mode, model_name, stream_url, reconnect_info=""):
     """绘制 HUD 信息条。"""
     h, w = frame.shape[:2]
 
     # 顶部半透明条
     overlay = frame.copy()
-    cv2.rectangle(overlay, (0, 0), (w, 38), (0, 0, 0), -1)
+    cv2.rectangle(overlay, (0, 0), (w, 48), (0, 0, 0), -1)
     cv2.addWeighted(overlay, 0.45, frame, 0.55, 0, frame)
 
     cv2.putText(frame, f"FPS: {fps:.1f}", (8, 24),
@@ -259,6 +270,16 @@ def draw_hud(frame, fps, mode, model_name):
                 cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 200, 0), 1)
     cv2.putText(frame, f"Model: {model_name}", (300, 24),
                 cv2.FONT_HERSHEY_SIMPLEX, 0.5, (180, 180, 180), 1)
+
+    # 流地址（截断显示）
+    short_url = stream_url if len(stream_url) <= 40 else stream_url[:37] + "..."
+    cv2.putText(frame, f"Stream: {short_url}", (8, 42),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.4, (100, 180, 255), 1)
+
+    # 重连状态
+    if reconnect_info:
+        cv2.putText(frame, reconnect_info, (300, 42),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.4, (0, 200, 255), 1)
 
     # 底部提示
     bot_y = h - 12
@@ -271,10 +292,25 @@ def draw_hud(frame, fps, mode, model_name):
     return frame
 
 
+def open_stream(url: str) -> cv2.VideoCapture | None:
+    """打开视频流，返回 cv2.VideoCapture 对象，失败返回 None。"""
+    cap = cv2.VideoCapture(url)
+    if not cap.isOpened():
+        return None
+
+    # 预热：读取几帧确保连接稳定
+    for _ in range(3):
+        cap.read()
+
+    return cap
+
+
 def main():
     print("=" * 60)
-    print("  YOLO 流式视频检测测试")
+    print("  YOLO 远端视频流检测/分类")
     print("=" * 60)
+    print(f"  流地址: {STREAM_URL}")
+    print()
 
     # ---- 检测 OpenCV GUI 可用性 ----
     if not _check_opencv_gui_available():
@@ -313,6 +349,7 @@ def main():
     print(f"[INFO] 模型: {model_path.name}")
     print(f"[INFO] 置信度阈值: {OBJECT_CONFIDENCE}")
     print(f"[INFO] 推理尺寸: {OBJECT_IMGSZ}")
+    print(f"[INFO] 帧步长: {FRAME_STRIDE}（每 {FRAME_STRIDE} 帧推理一次）")
 
     model = YOLO(str(model_path))
 
@@ -358,16 +395,18 @@ def main():
     print(f"[INFO] 模型类别: {class_names}")
 
     # ------------------------------------------------------------
-    # 打开摄像头
+    # 打开远端视频流
     # ------------------------------------------------------------
-    cap = cv2.VideoCapture(0)
-    if not cap.isOpened():
-        print("[ERROR] 无法打开摄像头。")
+    print(f"\n[INFO] 正在连接视频流: {STREAM_URL}")
+    cap = open_stream(STREAM_URL)
+    if cap is None:
+        print(f"[ERROR] 无法连接到视频流: {STREAM_URL}")
+        print("        请确认服务器已启动且地址正确。")
         sys.exit(1)
 
     actual_w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
     actual_h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-    print(f"[INFO] 摄像头分辨率: {actual_w}x{actual_h}")
+    print(f"[INFO] 视频流分辨率: {actual_w}x{actual_h}")
 
     # ------------------------------------------------------------
     # 状态变量
@@ -376,8 +415,11 @@ def main():
     fps = 0.0
     frame_count = 0
     last_fps_time = time.time()
+    reconnect_attempts = 0
+    reconnect_info = ""
+    last_inference_frame = None  # 缓存的上一帧推理结果
 
-    WINDOW_NAME = "VideoDetection"
+    WINDOW_NAME = "StreamDetection"
 
     print("\n[INFO] 流式检测已启动，按 Q 退出...\n")
 
@@ -387,8 +429,41 @@ def main():
     while True:
         ret, frame = cap.read()
         if not ret or frame is None:
-            time.sleep(0.01)
+            print("  [WARN] 读取帧失败，尝试重连...")
+            reconnect_attempts += 1
+
+            if reconnect_attempts > MAX_RECONNECT_ATTEMPTS:
+                print(f"  [ERROR] 重连失败已达上限 ({MAX_RECONNECT_ATTEMPTS} 次)，退出。")
+                break
+
+            reconnect_info = f"Reconnecting... ({reconnect_attempts}/{MAX_RECONNECT_ATTEMPTS})"
+            print(f"  {reconnect_info}")
+
+            # 如果还有上一帧缓存，显示断线画面
+            if last_inference_frame is not None:
+                display_frame = last_inference_frame.copy()
+                # 叠加断线提示
+                h, w = display_frame.shape[:2]
+                cv2.putText(display_frame, "STREAM LOST - RECONNECTING...",
+                            (w // 2 - 200, h // 2),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 0, 255), 2)
+                cv2.imshow(WINDOW_NAME, display_frame)
+                cv2.waitKey(1)
+
+            cap.release()
+            time.sleep(RECONNECT_DELAY)
+            cap = open_stream(STREAM_URL)
+            if cap is not None:
+                print("  [INFO] 重连成功！")
+                reconnect_attempts = 0
+                reconnect_info = ""
+            else:
+                reconnect_info = f"Reconnect failed ({reconnect_attempts}/{MAX_RECONNECT_ATTEMPTS})"
             continue
+
+        # 重置重连计数（成功读取到帧）
+        reconnect_attempts = 0
+        reconnect_info = ""
 
         frame_count += 1
 
@@ -400,51 +475,67 @@ def main():
             frame_count = 0
             last_fps_time = now
 
-        # ---- 流式推理 ----
-        t0 = time.time()
-        results = model.predict(
-            source=frame,
-            imgsz=OBJECT_IMGSZ,
-            conf=OBJECT_CONFIDENCE,
-            device=device,
-            verbose=False,
-        )
-        inference_ms = (time.time() - t0) * 1000
+        # ---- 帧步长控制：每隔 FRAME_STRIDE 帧做一次推理 ----
+        should_infer = (frame_count % FRAME_STRIDE == 0)
 
-        result = results[0]
+        if should_infer:
+            t0 = time.time()
+            results = model.predict(
+                source=frame,
+                imgsz=OBJECT_IMGSZ,
+                conf=OBJECT_CONFIDENCE,
+                device=device,
+                verbose=False,
+            )
+            inference_ms = (time.time() - t0) * 1000
 
-        # ---- 绘制结果 ----
-        if mode == "detection" and result.boxes is not None:
-            n_objects = len(result.boxes)
-            # 对 pencil/eraser/block 重叠位置进行优先级过滤
-            skip_set = filter_overlapping_by_priority(result, class_names)
-            n_filtered = n_objects - len(skip_set)
-            frame = draw_detection_boxes(frame, result, class_names, skip_set)
-            if n_filtered > 0:
-                print(f"  [DETECT] {n_filtered} objects | {inference_ms:.0f}ms", end="")
-                printed = 0
-                for i in range(n_objects):
-                    if i in skip_set:
-                        continue
-                    cls_id = int(result.boxes.cls[i])
-                    conf = float(result.boxes.conf[i])
-                    name = class_names.get(cls_id, "?")
-                    print(f"  {name}:{conf:.2f}", end="")
-                    printed += 1
-                    if printed >= 5:
-                        break
-                print()
+            result = results[0]
 
-        elif mode == "classification" and result.probs is not None:
-            top1_id = int(result.probs.top1)
-            top1_conf = float(result.probs.top1conf)
-            top1_name = class_names.get(top1_id, "?")
-            frame = draw_classification_overlay(frame, result, class_names)
-            print(f"  [CLASSIFY] #{1} {top1_name}:{top1_conf:.3f} | {inference_ms:.0f}ms")
+            # ---- 绘制结果 ----
+            if mode == "detection" and result.boxes is not None:
+                n_objects = len(result.boxes)
+                skip_set = filter_overlapping_by_priority(result, class_names)
+                n_filtered = n_objects - len(skip_set)
+                frame = draw_detection_boxes(frame, result, class_names, skip_set)
+                if n_filtered > 0:
+                    det_str = f"  [DETECT] {n_filtered} objects | {inference_ms:.0f}ms"
+                    printed = 0
+                    for i in range(n_objects):
+                        if i in skip_set:
+                            continue
+                        cls_id = int(result.boxes.cls[i])
+                        conf = float(result.boxes.conf[i])
+                        name = class_names.get(cls_id, "?")
+                        det_str += f"  {name}:{conf:.2f}"
+                        printed += 1
+                        if printed >= 5:
+                            break
+                    print(det_str)
+
+            elif mode == "classification" and result.probs is not None:
+                top1_id = int(result.probs.top1)
+                top1_conf = float(result.probs.top1conf)
+                top1_name = class_names.get(top1_id, "?")
+                frame = draw_classification_overlay(frame, result, class_names)
+                print(f"  [CLASSIFY] #{1} {top1_name}:{top1_conf:.3f} | {inference_ms:.0f}ms")
+
+            # 缓存当前帧（含推理结果），用于断线时显示
+            last_inference_frame = frame.copy()
+        else:
+            # 跳过推理的帧：复用上一次的检测框绘制 + 本帧原始画面
+            if last_inference_frame is not None:
+                # 如果上一帧有推理结果，可以简单保持原始帧用于流畅显示
+                pass
 
         # ---- HUD ----
         if show_hud:
-            frame = draw_hud(frame, fps, mode, model_path.name)
+            frame = draw_hud(frame, fps, mode, model_path.name, STREAM_URL, reconnect_info)
+        else:
+            # 即使关闭 HUD，也显示重连信息
+            if reconnect_info:
+                h, _ = frame.shape[:2]
+                cv2.putText(frame, reconnect_info, (8, h - 20),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 200, 255), 1)
 
         # ---- 显示 ----
         cv2.imshow(WINDOW_NAME, frame)
@@ -452,7 +543,7 @@ def main():
         # ---- 按键 ----
         key = cv2.waitKey(1) & 0xFF
 
-        if key == ord("q") or key == 27:
+        if key == ord("q") or key == 27:  # Q / ESC
             print("\n[INFO] 用户退出。")
             break
         elif key == ord("m"):
@@ -475,7 +566,7 @@ def main():
     # ------------------------------------------------------------
     cap.release()
     cv2.destroyAllWindows()
-    print("[INFO] 测试结束。")
+    print("[INFO] 程序结束。")
 
 
 if __name__ == "__main__":

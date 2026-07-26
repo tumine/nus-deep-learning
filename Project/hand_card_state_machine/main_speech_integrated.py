@@ -13,6 +13,7 @@ Temporary keyboard triggers remain as a manual override/fallback.
 """
 
 import cv2
+import os
 import socket
 import threading
 import queue
@@ -31,6 +32,7 @@ from task_queue import TaskQueue
 
 from ui_manager import UIManager
 from ui_server import UIServer
+from voice_transmission import VoiceTransmissionManager
 
 # ==============================================================================
 # ⚠️ 系统及网络配置区 
@@ -52,6 +54,9 @@ ROBOT_PORT = 9999
 MAX_CAMERA_FAILURES = 5       # 连续失败帧数阈值
 MAX_CAMERA_RECONNECTS = 3     # 最多重连次数
 CAMERA_RECONNECT_DELAY = 2.0  # 重连前等待秒数
+
+# 视频录制配置
+RECORDING_DIR = "recordings"  # 录制视频保存目录
 # ==============================================================================
 
 
@@ -383,6 +388,13 @@ def main(speech_detector=None):
         # 初始状态都保持关闭；只有进入 WAIT_CARD 才会 enable()。
         speech_detector.disable()
 
+        # Wire up the WebRTC microphone transmission manager so the
+        # browser can stream microphone audio to the speech detector.
+        voice_manager = VoiceTransmissionManager(
+            speech_detector=speech_detector,
+        )
+        ui_server.voice_manager = voice_manager
+
         # WAIT_CARD session guards:
         # - request_session_active: whether visual/speech detectors are armed
         # - request_accepted: guarantees only one request is accepted per student
@@ -392,6 +404,11 @@ def main(speech_detector=None):
         # 记录上一次发送指令时的状态，防止在同一个状态下一帧一帧疯狂重复发指令
         command_sent_for_state = None
         audio_prompt_state = None
+
+        # 视频录制相关变量
+        recording_writer = None
+        recording_active = False
+        recording_filename = None
 
         print("\n[MAIN] 状态触发控制说明:")
         print("  ▶ 正常情况：小车通过网络自动发送触发信号，自动跳转流程。")
@@ -559,6 +576,10 @@ def main(speech_detector=None):
             # 帧读取成功，重置失败计数器
             camera_failures = 0
 
+            # 如果正在录制，将当前帧写入视频文件
+            if recording_active and recording_writer is not None:
+                recording_writer.write(frame)
+
             # 3. 核心业务状态机流转
             current_state = state_machine.get_state()
             if command_sent_for_state != current_state:
@@ -597,6 +618,16 @@ def main(speech_detector=None):
                 request_accepted = False
                 request_session_active = True
 
+                # 开始录制摄像头视频流
+                os.makedirs(RECORDING_DIR, exist_ok=True)
+                timestamp = time.strftime("%Y%m%d_%H%M%S")
+                recording_filename = os.path.join(RECORDING_DIR, f"recording_{timestamp}.avi")
+                h, w = frame.shape[:2]
+                fourcc = cv2.VideoWriter_fourcc(*"XVID")
+                recording_writer = cv2.VideoWriter(recording_filename, fourcc, 20.0, (w, h))
+                recording_active = True
+                print(f"[RECORDING] 开始录制视频: {recording_filename}")
+
                 if hasattr(card_detector, "reset_session"):
                     card_detector.reset_session()
 
@@ -609,6 +640,19 @@ def main(speech_detector=None):
                 print_separator()
 
             elif current_state != RobotState.WAIT_CARD and request_session_active:
+                # 离开 WAIT_CARD 但没有识别到结果，停止录制并丢弃视频
+                if recording_active and recording_writer is not None:
+                    recording_writer.release()
+                    recording_writer = None
+                    recording_active = False
+                    print(f"[RECORDING] 未识别到结果，停止录制。")
+                    # 可选择删除未使用的录制文件
+                    try:
+                        os.remove(recording_filename)
+                        print(f"[RECORDING] 已删除未使用的视频: {recording_filename}")
+                    except OSError:
+                        pass
+
                 speech_detector.disable()
                 speech_detector.clear()
                 request_session_active = False
@@ -670,6 +714,13 @@ def main(speech_detector=None):
                         # Main-level lock: prevents visual and speech from
                         # creating two tasks in the same student interaction.
                         request_accepted = True
+
+                        # 停止录制并保存视频
+                        if recording_active and recording_writer is not None:
+                            recording_writer.release()
+                            recording_writer = None
+                            recording_active = False
+                            print(f"[RECORDING] 识别到结果，停止录制，视频已保存: {recording_filename}")
 
                         # Stop listening immediately after the first accepted
                         # request. The next student session will re-enable it.
@@ -862,6 +913,9 @@ def main(speech_detector=None):
 
         if camera is not None:
             camera.release()
+
+        if recording_writer is not None:
+            recording_writer.release()
 
         # 2. 等待接收线程退出后再关闭 socket
         time.sleep(0.8)

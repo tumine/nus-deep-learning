@@ -13,8 +13,8 @@
   可选：scipy（更高质量的音频重采样）、cryptography（SSL 证书生成）
 
 使用方式：
-  python voice_transmission_server.py [--port 8080] [--threshold 0.3]
-  手机通过 Tailscale 访问：https://<电脑Tailscale-IP>:8080
+  python voice_transmission_server.py [--port 8081] [--threshold 0.3]
+  手机通过 Tailscale 访问：https://<电脑Tailscale-IP>:8081
   （首次访问需在浏览器中接受自签名证书警告）
 """
 
