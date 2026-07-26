@@ -9,8 +9,10 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 import uuid
@@ -19,9 +21,10 @@ from pathlib import Path
 from typing import Any
 
 import uvicorn
-from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect
+from fastapi import FastAPI, File, HTTPException, UploadFile, WebSocket, WebSocketDisconnect
 from fastapi.responses import HTMLResponse
 
+from intent_parser import parse_request as parse_intent
 from ui_manager import UIManager
 from voice_transmission import VoiceTransmissionManager
 
@@ -279,9 +282,9 @@ button:disabled{background:#cbd5e1;color:#64748b;cursor:not-allowed;opacity:.72}
           <button
             class="mic"
             id="micButton"
-            onclick="toggleMicrophone()"
+            onclick="toggleRecording()"
           >
-            🎤 Start Microphone
+            🎤 Record Request
           </button>
 
           <button class="stop" onclick="sendCommand('STOP')">
@@ -321,7 +324,7 @@ let socket = null;
 let requests = [];
 let phoneAudioEnabled = false;
 let audioContext = null;
-let micPc = null, micStream = null, micActive = false;
+let mediaRecorder = null, recordingActive = false, recordedChunks = [];
 const reconnectDelayMilliseconds = 500;
 
 function log(text){
@@ -457,17 +460,6 @@ function handleMessage(message){
       reportAudioPlayback(data.request_id,false);
       log("Audio playback ignored until phone audio is enabled.");
     }
-  }else if(type==="mic_status"){
-    const isActive=!!(data&&data.active);
-    if(isActive!==micActive){
-      micActive=isActive;
-      updateMicButton();
-      if(isActive){
-        log("Microphone transmission active ("+(data.elapsed_seconds||0)+"s).");
-      }else{
-        log("Microphone transmission stopped.");
-      }
-    }
   }
 }
 function connect(){
@@ -510,121 +502,97 @@ function sendCommand(command){
 }
 
 // ============================================================
-//  WebRTC Microphone Transmission
+//  MediaRecorder Speech Recording (Whisper-based)
 // ============================================================
 
-function updateMicButton(){
+function updateRecordingButton(active){
   const btn=document.getElementById("micButton");
-  if(micActive){
-    btn.textContent="🔴 Stop Microphone";
+  if(active){
+    btn.textContent="⏹ Stop Recording & Send";
     btn.className="mic active";
   }else{
-    btn.textContent="🎤 Start Microphone";
+    btn.textContent="🎤 Record Request";
     btn.className="mic";
   }
 }
 
-function stopLocalMicrophone(){
-  if(micPc){micPc.close();micPc=null;}
-  if(micStream){micStream.getTracks().forEach(t=>t.stop());micStream=null;}
-  micActive=false;
-  updateMicButton();
-}
-
-async function toggleMicrophone(){
-  if(micActive){
-    await stopMicrophone();
+async function toggleRecording(){
+  if(recordingActive){
+    stopRecording();
   }else{
-    await startMicrophone();
+    await startRecording();
   }
 }
 
-async function startMicrophone(){
+async function startRecording(){
   const btn=document.getElementById("micButton");
   btn.disabled=true;
-  btn.textContent="⏳ Connecting...";
+  btn.textContent="⏳ Starting...";
 
   try{
     if(!navigator.mediaDevices||!navigator.mediaDevices.getUserMedia){
       throw new Error("Browser does not support microphone access. Use HTTPS.");
     }
 
-    micStream=await navigator.mediaDevices.getUserMedia({
+    const stream=await navigator.mediaDevices.getUserMedia({
       audio:{echoCancellation:true,noiseSuppression:true,autoGainControl:true}
     });
-    log("Microphone access granted.");
+    log("Microphone access granted. Recording...");
 
-    micPc=new RTCPeerConnection({
-      iceServers:[
-        {urls:"stun:stun.l.google.com:19302"},
-        {urls:"stun:stun.qq.com:3478"},
-      ]
-    });
+    const mimeType=MediaRecorder.isTypeSupported("audio/webm;codecs=opus")?
+      "audio/webm;codecs=opus":"audio/webm";
 
-    micPc.onconnectionstatechange=()=>{
-      const state=micPc&&micPc.connectionState;
-      if(state==="connected"){
-        micActive=true;
-        updateMicButton();
-        btn.disabled=false;
-        log("Microphone streaming active.");
-      }else if(["failed","disconnected","closed"].includes(state||"")){
-        stopLocalMicrophone();
-        log("Microphone connection lost: "+state,"cry");
-      }
+    mediaRecorder=new MediaRecorder(stream,{mimeType});
+    recordedChunks=[];
+
+    mediaRecorder.ondataavailable=(e)=>{
+      if(e.data.size>0) recordedChunks.push(e.data);
     };
 
-    micStream.getTracks().forEach(t=>micPc.addTrack(t,micStream));
+    mediaRecorder.onstop=async()=>{
+      stream.getTracks().forEach(t=>t.stop());
+      const blob=new Blob(recordedChunks,{type:mimeType});
+      log(`Recording stopped. Uploading ${(blob.size/1024).toFixed(1)}KB for transcription...`);
 
-    const offer=await micPc.createOffer();
-    await micPc.setLocalDescription(offer);
+      const formData=new FormData();
+      formData.append("audio",blob,"recording.webm");
 
-    // Wait for ICE gathering (with timeout)
-    await Promise.race([
-      new Promise(resolve=>{
-        if(micPc.iceGatheringState==="complete") return resolve();
-        micPc.addEventListener("icegatheringstatechange",()=>{
-          if(micPc.iceGatheringState==="complete") resolve();
-        });
-      }),
-      new Promise(resolve=>setTimeout(()=>{
-        log("ICE gathering timeout, proceeding with available candidates.");
-        resolve();
-      },8000))
-    ]);
+      try{
+        const resp=await fetch("/api/upload_speech",{method:"POST",body:formData});
+        const result=await resp.json();
+        if(result.status==="success"){
+          log(`Transcription: "${result.text}"`);
+          log(`Intent: ${result.request}`);
+          document.getElementById("currentRequest").textContent=result.request||"-";
+        }else{
+          log(`Speech recognition failed: ${result.error||"unknown error"}`);
+        }
+      }catch(err){
+        log(`Upload error: ${err.message}`);
+      }
 
-    const resp=await fetch("/webrtc/offer",{
-      method:"POST",
-      headers:{"Content-Type":"application/json"},
-      body:JSON.stringify({
-        sdp:micPc.localDescription.sdp,
-        type:micPc.localDescription.type
-      })
-    });
+      btn.disabled=false;
+      updateRecordingButton(false);
+    };
 
-    if(!resp.ok){
-      const errData=await resp.json().catch(()=>({}));
-      throw new Error(errData.detail||"Server returned "+resp.status);
-    }
-
-    const answer=await resp.json();
-    await micPc.setRemoteDescription(new RTCSessionDescription(answer));
-    log("WebRTC signaling completed.");
+    mediaRecorder.start();
+    recordingActive=true;
+    updateRecordingButton(true);
+    btn.disabled=false;
 
   }catch(err){
-    log("Microphone error: "+err.message);
-    stopLocalMicrophone();
+    log("Recording error: "+err.message);
     btn.disabled=false;
-    updateMicButton();
+    updateRecordingButton(false);
   }
 }
 
-async function stopMicrophone(){
-  try{
-    await fetch("/webrtc/stop",{method:"POST"});
-  }catch(e){}
-  stopLocalMicrophone();
-  log("Microphone transmission stopped.");
+function stopRecording(){
+  if(mediaRecorder&&mediaRecorder.state==="recording"){
+    mediaRecorder.stop();
+    recordingActive=false;
+    log("Stopping recording...");
+  }
 }
 connect();
 </script>
@@ -643,12 +611,16 @@ class UIServer:
         port: int = 8000,
         open_browser: bool = True,
         voice_transmission_manager: VoiceTransmissionManager | None = None,
+        whisper_model: Any = None,
+        speech_detector_for_whisper: Any = None,
     ) -> None:
         self.ui_manager = ui_manager
         self.host = host
         self.port = port
         self.open_browser = open_browser
         self.voice_manager = voice_transmission_manager
+        self.whisper_model = whisper_model
+        self.speech_detector_for_whisper = speech_detector_for_whisper
 
         # Generate self-signed SSL certificate so mobile browsers can
         # access the microphone (getUserMedia requires HTTPS).
@@ -819,6 +791,54 @@ class UIServer:
                     pass
 
             return {"status": "stopped"}
+
+        @self.app.post("/api/upload_speech")
+        async def upload_speech(audio: UploadFile = File(...)):
+            """Receive an audio recording from the browser, transcribe with
+            Whisper, and feed the result into the speech request detector."""
+            if self.whisper_model is None:
+                raise HTTPException(
+                    status_code=503,
+                    detail="Whisper model is not loaded.",
+                )
+
+            suffix = os.path.splitext(
+                audio.filename or "recording.webm"
+            )[1] or ".webm"
+            with tempfile.NamedTemporaryFile(
+                delete=False, suffix=suffix
+            ) as tmp:
+                content = await audio.read()
+                tmp.write(content)
+                tmp_path = tmp.name
+
+            try:
+                result = await asyncio.to_thread(
+                    self.whisper_model.transcribe, tmp_path
+                )
+                text = result.get("text", "").strip()
+
+                # Feed result into the speech request detector so the
+                # state machine can pick it up via poll().
+                if self.speech_detector_for_whisper is not None and text:
+                    self.speech_detector_for_whisper.push_result(text)
+
+                request_message = parse_intent(text)
+                return {
+                    "status": "success",
+                    "text": text,
+                    "request": request_message,
+                }
+            except Exception as exc:
+                return {
+                    "status": "error",
+                    "error": str(exc),
+                }
+            finally:
+                try:
+                    os.unlink(tmp_path)
+                except OSError:
+                    pass
 
         @self.app.websocket("/ws")
         async def websocket_endpoint(websocket: WebSocket) -> None:
