@@ -93,3 +93,9 @@ outputs
 collected_images*
 
 calib_images
+
+request_dataset
+
+recordings
+
+audio

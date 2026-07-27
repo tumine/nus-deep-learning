@@ -70,6 +70,7 @@ class UIManager:
         message_id: str | None = None,
         axis_x: float | None = None,
         axis_y: float | None = None,
+        confidence: float | None = None,
     ) -> None:
         request = {
             "message_id": message_id or f"REQ-{len(self._request_history) + 1:04d}",
@@ -77,6 +78,7 @@ class UIManager:
             "axis_y": axis_y,
             "request": request_type,
             "description": description,
+            "confidence": confidence,
             "received_at": datetime.now().isoformat(),
         }
 
