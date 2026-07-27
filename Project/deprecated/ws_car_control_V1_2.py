@@ -139,6 +139,7 @@ class CarHardware:
         print("[硬件初始化] 正在自动查找 Arduino 串口...")
         self.simulation_mode = False
         self.ser = None
+        self.last_cmd = None  # 【新增】记录最后一次发送的指令，用于障碍物后重试
         
         detected_port = find_arduino_port()
         if detected_port is None:
@@ -158,6 +159,7 @@ class CarHardware:
         print("==================================================\n")
 
     def send_arduino_cmd(self, cmd_str):
+        self.last_cmd = cmd_str  # 【新增】记录最后一次发送的指令
         if not self.simulation_mode and self.ser:
             self.ser.write((cmd_str + '\n').encode('utf-8'))
         print(f">>> [下发底盘指令] {cmd_str}")
@@ -178,9 +180,17 @@ class CarHardware:
                     print("    [底层反馈] Arduino: 动作执行完毕 (Done)")
                     break
                 elif line == "Obstacle Stop":
-                    print("\n🛑 [底层安全警报] 硬件触发全局障碍物急停！正在同步中断 Python 业务流...")
-                    stop_event.set() # 激活全局打断标志
-                    raise RuntimeError("底层硬件检测到障碍物，自动触发急停")
+                    # 【修改】非 TO 指令的障碍物停止：等待 3 秒后重试当前指令，不重置业务流程
+                    print("\n🛑 [底层安全警报] 硬件触发全局障碍物急停！")
+                    print("    ⏳ [障碍物等待] 等待 3 秒后自动重试当前指令...")
+                    for _ in range(30):  # 30 * 0.1 = 3 秒
+                        if stop_event.is_set():
+                            raise RuntimeError("在等待障碍物恢复时检测到紧急停车指令 S")
+                        time.sleep(0.1)
+                    if self.last_cmd:
+                        print(f"    🔄 [重试指令] 重新发送当前指令，继续执行...")
+                        self.send_arduino_cmd(self.last_cmd)
+                    # 不设置 stop_event，不抛出异常，继续循环等待 Done
             time.sleep(0.02)
         if stop_event.is_set():
             raise RuntimeError("在等待底盘响应时检测到紧急停车指令 S")

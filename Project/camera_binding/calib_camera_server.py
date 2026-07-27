@@ -10,7 +10,7 @@ calib_camera_server.py
 
 用法：
     python calib_camera_server.py
-    python calib_camera_server.py --port 8080 --camera 0 --resolution 1280x720 --save-dir ./calib_captures
+    python calib_camera_server.py --port 8081 --camera 0 --resolution 1280x720 --save-dir ./calib_captures
 """
 
 from __future__ import annotations
@@ -476,12 +476,12 @@ def main():
         epilog="""
 示例：
   python calib_camera_server.py
-  python calib_camera_server.py --port 8080 --camera 0
+  python calib_camera_server.py --port 8081 --camera 0
   python calib_camera_server.py --resolution 1280x720 --save-dir ./my_calib
         """,
     )
-    parser.add_argument("--port", type=int, default=8080,
-                        help="HTTP 服务端口（默认 8080）")
+    parser.add_argument("--port", type=int, default=8081,
+                        help="HTTP 服务端口（默认 8081）")
     parser.add_argument("--host", type=str, default="0.0.0.0",
                         help="监听地址（默认 0.0.0.0）")
     parser.add_argument("--camera", type=int, default=0,

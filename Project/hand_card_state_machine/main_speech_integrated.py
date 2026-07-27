@@ -70,6 +70,9 @@ RECORDING_DIR = "recordings"  # 录制视频保存目录
 SPEECH_TIMEOUT_SECONDS = 8.0  # 等待语音识别的最大秒数，超时后启用图像识别 fallback
 # ==============================================================================
 
+# 主循环和终端急停线程共用同一个 TCP socket；加锁避免并发 sendall。
+TCP_SEND_LOCK = threading.Lock()
+
 
 def print_separator():
     print("=" * 55)
@@ -131,8 +134,9 @@ def send_robot_command(sock, command_dict):
     print_separator()
 
     try:
-        # 发送指令并加上换行符，对应小车端的按行解析逻辑
-        sock.sendall((cmd_str + '\n').encode('utf-8'))
+        # 主循环与终端急停线程可能同时发送，必须串行写 socket。
+        with TCP_SEND_LOCK:
+            sock.sendall((cmd_str + '\n').encode('utf-8'))
         return True
     except Exception as e:
         print(f"❌ 发送指令失败: {e}")
@@ -336,6 +340,43 @@ def pc_input_listener(sock):
             break
 
 
+def reconnect_robot(ui_manager, network_queue, tcp_stop_event):
+    """尝试重新连接小车 TCP Server。
+
+    连接成功时：返回新的 socket，清空 stop_event 并重启接收线程和键盘监听线程。
+    连接失败时：返回 None。
+    """
+    print(f"\n🔄 [自动重连] 正在尝试重新连接小车 ({ROBOT_IP}:{ROBOT_PORT})...")
+    try:
+        new_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        new_sock.settimeout(5.0)
+        new_sock.connect((ROBOT_IP, ROBOT_PORT))
+        new_sock.settimeout(None)
+        print("✅ [自动重连] 成功重新连接到小车网络！")
+        ui_manager.update_connection("pi", True)
+
+        # 重启后台接收线程
+        tcp_stop_event.clear()
+        threading.Thread(
+            target=tcp_receive_thread,
+            args=(new_sock, network_queue, ui_manager, tcp_stop_event),
+            daemon=True,
+        ).start()
+
+        # 重启电脑端终端键盘输入监听线程
+        threading.Thread(
+            target=pc_input_listener,
+            args=(new_sock,),
+            daemon=True,
+        ).start()
+
+        return new_sock
+    except Exception as e:
+        print(f"❌ [自动重连] 连接失败: {e}")
+        ui_manager.update_connection("pi", False)
+        return None
+
+
 def main(speech_detector=None):
     print_separator()
     print("Starting Classroom Assistant...")
@@ -531,7 +572,23 @@ def main(speech_detector=None):
                         state_machine.reset()
 
                 elif net_msg == "connection_lost":
-                    print("🛑 [安全提示] 小车连接已断开。")
+                    print("🛑 [安全提示] 小车连接已断开；停止继续下发业务指令。")
+                    robot_connection_lost = True
+                    speech_detector.disable()
+                    speech_detector.clear()
+
+                    # 关闭旧 socket，准备自动重连
+                    if tcp_socket is not None:
+                        try:
+                            tcp_socket.close()
+                        except OSError:
+                            pass
+                        tcp_socket = None
+
+                    # 初始化自动重连状态（立即开始第一次重连）
+                    reconnect_in_progress = True
+                    reconnect_attempts = 0
+                    last_reconnect_time = 0.0
 
                 elif net_msg == "intersection_reached":
                     if current_state == RobotState.PATROL:
@@ -584,6 +641,35 @@ def main(speech_detector=None):
                             "本次按键已忽略。"
                         )
 
+            # 1.5. 自动重连逻辑：断连后定时尝试重新连接小车
+            if reconnect_in_progress and robot_connection_lost:
+                now = time.monotonic()
+                if now - last_reconnect_time >= ROBOT_RECONNECT_INTERVAL_SECONDS:
+                    if reconnect_attempts >= MAX_ROBOT_RECONNECT_ATTEMPTS:
+                        print(
+                            f"❌ [自动重连] 已尝试 {MAX_ROBOT_RECONNECT_ATTEMPTS} 次，"
+                            "全部失败，停止自动重连。请手动检查网络后重启程序。"
+                        )
+                        reconnect_in_progress = False
+                    else:
+                        reconnect_attempts += 1
+                        last_reconnect_time = now
+                        print(
+                            f"[自动重连] 第 {reconnect_attempts}/"
+                            f"{MAX_ROBOT_RECONNECT_ATTEMPTS} 次尝试..."
+                        )
+                        new_sock = reconnect_robot(
+                            ui_manager, network_queue, tcp_stop_event
+                        )
+                        if new_sock is not None:
+                            tcp_socket = new_sock
+                            robot_connection_lost = False
+                            reconnect_in_progress = False
+                            command_sent_for_state = None  # 允许重新下发指令
+                            print(
+                                "✅ [自动重连] 连接已恢复，系统恢复正常运行。"
+                            )
+
             # 2. 读取一帧摄像头画面
             frame = camera.read()
             if frame is None:
@@ -623,19 +709,21 @@ def main(speech_detector=None):
             # physical-button step is unlocked until the phone confirms playback.
             if current_state != audio_prompt_state:
                 if current_state == RobotState.WAIT_LOADING:
-                    if not play_audio_with_feedback(4, ui_manager):
-                        continue
-                    send_robot_command(
-                        tcp_socket,
-                        {"command": "arm_loading_button"},
-                    )
+                    # 提示音失败不能把整个状态机永久卡死；仍允许物理按钮继续流程。
+                    play_audio_with_feedback(4, ui_manager)
+                    if not robot_connection_lost:
+                        send_robot_command(
+                            tcp_socket,
+                            {"command": "arm_loading_button"},
+                        )
                 elif current_state == RobotState.WAIT_UNLOAD:
-                    if not play_audio_with_feedback(5, ui_manager):
-                        continue
-                    send_robot_command(
-                        tcp_socket,
-                        {"command": "arm_unload_button"},
-                    )
+                    # 提示音失败不能把整个状态机永久卡死；仍允许物理按钮继续流程。
+                    play_audio_with_feedback(5, ui_manager)
+                    if not robot_connection_lost:
+                        send_robot_command(
+                            tcp_socket,
+                            {"command": "arm_unload_button"},
+                        )
                 audio_prompt_state = current_state
 
             # --------------------------------------------------------------
@@ -651,6 +739,7 @@ def main(speech_detector=None):
 
                 request_accepted = False
                 request_session_active = True
+                request_input_mode = "speech"
 
                 # 开始录制摄像头视频流
                 os.makedirs(RECORDING_DIR, exist_ok=True)
@@ -705,7 +794,9 @@ def main(speech_detector=None):
                 frame = hand_detector.draw(frame)
 
             elif current_state == RobotState.APPROACH_STUDENT:
-                if command_sent_for_state is None:
+                if robot_connection_lost:
+                    pass
+                elif command_sent_for_state is None:
                     command = {
                         "command": "approach_student",
                         "route_node": state_machine.get_context_value("route_node"),
@@ -727,11 +818,11 @@ def main(speech_detector=None):
                     speech_raw = speech_detector.poll()
                     speech_event = None
 
-                    if speech_raw is not None:
-                        speech_event = normalize_speech_event(
-                            speech_raw,
-                            state_machine,
-                        )
+                        if speech_raw is not None:
+                            accepted_event = normalize_speech_event(
+                                speech_raw,
+                                state_machine,
+                            )
 
                     # ── 图像识别：仅在语音超时后启用 ──
                     visual_events = []
@@ -774,6 +865,8 @@ def main(speech_detector=None):
                         # request. The next student session will re-enable it.
                         speech_detector.disable()
                         speech_detector.clear()
+                        request_input_mode = None
+                        speech_listen_started_at = None
 
                         handle_request_event(
                             accepted_event,
@@ -806,7 +899,9 @@ def main(speech_detector=None):
                 frame = card_detector.draw(frame)
 
             elif current_state == RobotState.GO_TEACHER:
-                if command_sent_for_state is None:
+                if robot_connection_lost:
+                    pass
+                elif command_sent_for_state is None:
                     if not task_queue.has_task():
                         print("[WARNING] GO_TEACHER entered with empty queue.")
                         state_machine.reset()
@@ -828,7 +923,9 @@ def main(speech_detector=None):
                 pass
 
             elif current_state == RobotState.RETURN_STUDENT:
-                if command_sent_for_state is None:
+                if robot_connection_lost:
+                    pass
+                elif command_sent_for_state is None:
                     command = {
                         "command": "return_student",
                         "task": state_machine.get_task(),
@@ -845,7 +942,9 @@ def main(speech_detector=None):
                 pass
 
             elif current_state == RobotState.RETURN_PATROL:
-                if command_sent_for_state is None:
+                if robot_connection_lost:
+                    pass
+                elif command_sent_for_state is None:
                     command = {
                         "command": "return_patrol",
                         "route_node": state_machine.get_context_value("route_node"),
@@ -955,7 +1054,8 @@ def main(speech_detector=None):
         if tcp_socket is not None:
             try:
                 print("[SAFETY] Sending stop command before shutdown...")
-                tcp_socket.sendall(b"S\n")
+                with TCP_SEND_LOCK:
+                    tcp_socket.sendall(b"S\n")
             except OSError:
                 pass
 
@@ -978,4 +1078,4 @@ def main(speech_detector=None):
 
 
 if __name__ == "__main__":
-    main()  
+    main()
