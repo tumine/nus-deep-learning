@@ -13,7 +13,6 @@ Temporary keyboard triggers remain as a manual override/fallback.
 """
 
 import cv2
-import os
 import socket
 import threading
 import queue
@@ -32,15 +31,6 @@ from task_queue import TaskQueue
 
 from ui_manager import UIManager
 from ui_server import UIServer
-
-try:
-    import whisper
-    HAS_WHISPER = True
-except ImportError:
-    HAS_WHISPER = False
-    whisper = None
-    print("[WARNING] openai-whisper not installed. Speech recognition via "
-          "the web UI will be unavailable. Install: pip install openai-whisper")
 
 # ==============================================================================
 # ⚠️ 系统及网络配置区 
@@ -63,11 +53,16 @@ MAX_CAMERA_FAILURES = 5       # 连续失败帧数阈值
 MAX_CAMERA_RECONNECTS = 3     # 最多重连次数
 CAMERA_RECONNECT_DELAY = 2.0  # 重连前等待秒数
 
-# 视频录制配置
-RECORDING_DIR = "recordings"  # 录制视频保存目录
+# 网络断连自动重连配置
+MAX_ROBOT_RECONNECT_ATTEMPTS = 10       # 最多重连次数
+ROBOT_RECONNECT_INTERVAL_SECONDS = 3.0  # 每次重连间隔秒数
 
-# 语音识别超时配置
-SPEECH_TIMEOUT_SECONDS = 8.0  # 等待语音识别的最大秒数，超时后启用图像识别 fallback
+# WAIT_CARD 识别顺序：
+# 1. 提示音完整播放结束；
+# 2. 仅开启语音识别；
+# 3. 若在该时间内没有识别到有效语音请求，关闭语音并启用物品识别。
+# 默认语音窗口为 3 秒，还需预留 Google 识别返回时间，因此设置为 6 秒。
+SPEECH_ONLY_TIMEOUT_SECONDS = 6.0
 # ==============================================================================
 
 # 主循环和终端急停线程共用同一个 TCP socket；加锁避免并发 sendall。
@@ -390,24 +385,24 @@ def main(speech_detector=None):
 
     ui_manager = UIManager()
 
+    # Create the shared detector before starting the UI server, because the
+    # same port-8000 webpage now provides both playback and microphone input.
+    if speech_detector is None:
+        speech_detector = SpeechRequestDetector(
+            microphone_index=None,
+            language="en-US",
+        )
+        speech_detector.start()
+    speech_detector.disable()
+
     ui_server = UIServer(
         ui_manager=ui_manager,
+        speech_detector=speech_detector,
         host="0.0.0.0",
         port=8000,
     )
 
     ui_server.start_in_thread()
-
-    # Sync the audio dispatcher's URL protocol with the UI server.
-    # When SSL certificates are available, the UI server only speaks
-    # HTTPS, but audio_dispatcher.py defaults to HTTP.  An HTTP
-    # request sent to an HTTPS server results in an immediate TCP
-    # RST (WinError 10054) because the server expects a TLS handshake.
-    from audio_dispatcher import _default_dispatcher as _audio_disp
-    protocol = "https" if ui_server._use_https else "http"
-    _audio_disp.server_url = (
-        f"{protocol}://127.0.0.1:{ui_server.port}/api/audio"
-    )
 
     # 尝试连接小车的 TCP Server
     print(f"🔌 正在尝试连接到小车控制端 ({ROBOT_IP}:{ROBOT_PORT})...")
@@ -440,29 +435,9 @@ def main(speech_detector=None):
         state_machine = StateMachine()
         ui_manager.update_robot_state(state_machine.get_state().name)
         last_ui_state = state_machine.get_state()
-        if speech_detector is None:
-            speech_detector = SpeechRequestDetector(
-                microphone_index=None,
-                language="en-US",
-            )
-            speech_detector.start()
-
         # 无论检测器由 main 创建还是由统一启动脚本传入，
         # 初始状态都保持关闭；只有进入 WAIT_CARD 才会 enable()。
         speech_detector.disable()
-
-        # Load Whisper model and wire it to the UI server for speech
-        # recognition.  The browser records audio via MediaRecorder,
-        # uploads it to /api/upload_speech, and the transcribed result
-        # is fed back into the SpeechRequestDetector via push_result().
-        if HAS_WHISPER:
-            print("[WHISPER] Loading Whisper model (base)...")
-            whisper_model = whisper.load_model("base")
-            ui_server.whisper_model = whisper_model
-            ui_server.speech_detector_for_whisper = speech_detector
-            print("[WHISPER] Model loaded and wired to UI server.")
-        else:
-            print("[WHISPER] Not available — web speech recording disabled.")
 
         # WAIT_CARD session guards:
         # - request_session_active: whether visual/speech detectors are armed
@@ -470,20 +445,21 @@ def main(speech_detector=None):
         request_session_active = False
         request_accepted = False
 
-        # 语音优先策略：
-        # - speech_phase_start_time: 语音阶段开始时间（用于超时判断）
-        # - image_fallback_active:  语音超时后是否已启用图像识别
-        speech_phase_start_time = None
-        image_fallback_active = False
+        # WAIT_CARD 内部阶段：
+        # - speech: 提示音结束后，仅进行语音识别
+        # - vision: 语音超时后，关闭语音并启用物品识别
+        request_input_mode = None
+        speech_listen_started_at = None
 
         # 记录上一次发送指令时的状态，防止在同一个状态下一帧一帧疯狂重复发指令
         command_sent_for_state = None
         audio_prompt_state = None
+        robot_connection_lost = False
 
-        # 视频录制相关变量
-        recording_writer = None
-        recording_active = False
-        recording_filename = None
+        # 自动重连状态跟踪
+        reconnect_in_progress = False
+        reconnect_attempts = 0
+        last_reconnect_time = 0.0
 
         print("\n[MAIN] 状态触发控制说明:")
         print("  ▶ 正常情况：小车通过网络自动发送触发信号，自动跳转流程。")
@@ -696,10 +672,6 @@ def main(speech_detector=None):
             # 帧读取成功，重置失败计数器
             camera_failures = 0
 
-            # 如果正在录制，将当前帧写入视频文件
-            if recording_active and recording_writer is not None:
-                recording_writer.write(frame)
-
             # 3. 核心业务状态机流转
             current_state = state_machine.get_state()
             if command_sent_for_state != current_state:
@@ -732,56 +704,39 @@ def main(speech_detector=None):
             # --------------------------------------------------------------
             if current_state == RobotState.WAIT_CARD and not request_session_active:
                 print("[AUDIO] Robot arrived at student; playing request prompt.")
-                audio_ok = play_audio_with_feedback(1, ui_manager)
-                if not audio_ok:
-                    print("[AUDIO WARNING] Request prompt playback failed. "
-                          "Proceeding with speech detection anyway.")
+
+                # 必须等待提示音完整播放结束后，才开始收集语音。
+                # 这样提示音本身不会进入 3 秒语音识别窗口。
+                play_audio_with_feedback(1, ui_manager)
 
                 request_accepted = False
                 request_session_active = True
                 request_input_mode = "speech"
 
-                # 开始录制摄像头视频流
-                os.makedirs(RECORDING_DIR, exist_ok=True)
-                timestamp = time.strftime("%Y%m%d_%H%M%S")
-                recording_filename = os.path.join(RECORDING_DIR, f"recording_{timestamp}.avi")
-                h, w = frame.shape[:2]
-                fourcc = cv2.VideoWriter_fourcc(*"XVID")
-                recording_writer = cv2.VideoWriter(recording_filename, fourcc, 20.0, (w, h))
-                recording_active = True
-                print(f"[RECORDING] 开始录制视频: {recording_filename}")
+                if hasattr(card_detector, "reset_session"):
+                    card_detector.reset_session()
 
-                # 语音优先：先启动语音识别，暂不启动图像识别
+                # 清除提示音播放期间可能残留的旧数据，然后才正式开启收音。
+                speech_detector.disable()
                 speech_detector.clear()
                 speech_detector.enable()
-                speech_phase_start_time = time.monotonic()
-                image_fallback_active = False
+                speech_listen_started_at = time.monotonic()
 
                 print_separator()
-                print("[REQUEST SESSION] Speech recognition started (priority).")
-                print(f"[REQUEST SESSION] Image recognition will start after "
-                      f"{SPEECH_TIMEOUT_SECONDS:.0f}s if no speech is detected.")
+                print("[REQUEST SESSION] Prompt finished.")
+                print(
+                    "[REQUEST SESSION] Speech-only recognition enabled for "
+                    f"{SPEECH_ONLY_TIMEOUT_SECONDS:.1f} seconds."
+                )
+                print("[REQUEST SESSION] Object recognition is currently disabled.")
                 print_separator()
 
             elif current_state != RobotState.WAIT_CARD and request_session_active:
-                # 离开 WAIT_CARD 但没有识别到结果，停止录制并丢弃视频
-                if recording_active and recording_writer is not None:
-                    recording_writer.release()
-                    recording_writer = None
-                    recording_active = False
-                    print(f"[RECORDING] 未识别到结果，停止录制。")
-                    # 可选择删除未使用的录制文件
-                    try:
-                        os.remove(recording_filename)
-                        print(f"[RECORDING] 已删除未使用的视频: {recording_filename}")
-                    except OSError:
-                        pass
-
                 speech_detector.disable()
                 speech_detector.clear()
                 request_session_active = False
-                image_fallback_active = False
-                speech_phase_start_time = None
+                request_input_mode = None
+                speech_listen_started_at = None
 
             if current_state == RobotState.PATROL:
                 # 预留给未来拓展
@@ -808,15 +763,15 @@ def main(speech_detector=None):
                         command_sent_for_state = current_state
 
             elif current_state == RobotState.WAIT_CARD:
-                # ── 意图识别策略：语音优先，超时后回退到图像 ──
-                # 1. 每帧首先检查语音结果（始终最高优先级）
-                # 2. 若语音在 SPEECH_TIMEOUT_SECONDS 内返回结果 → 直接接受
-                # 3. 若语音超时无结果 → 启动图像识别作为 fallback
-                # 4. 图像 fallback 启动后，语音仍保持监听（后续若有人说话，语音仍优先）
+                # 严格顺序：
+                #   1. 提示音结束后，只进行语音识别；
+                #   2. 语音成功则立即接受；
+                #   3. 语音超时仍无有效请求，才关闭语音并启动物品识别。
                 if not request_accepted:
-                    # ── 语音识别：始终优先检查 ──
-                    speech_raw = speech_detector.poll()
-                    speech_event = None
+                    accepted_event = None
+
+                    if request_input_mode == "speech":
+                        speech_raw = speech_detector.poll()
 
                         if speech_raw is not None:
                             accepted_event = normalize_speech_event(
@@ -824,42 +779,42 @@ def main(speech_detector=None):
                                 state_machine,
                             )
 
-                    # ── 图像识别：仅在语音超时后启用 ──
-                    visual_events = []
-                    if speech_event is None:
-                        if not image_fallback_active:
-                            elapsed = time.monotonic() - speech_phase_start_time
-                            if elapsed >= SPEECH_TIMEOUT_SECONDS:
-                                print(
-                                    f"[FALLBACK] Speech timed out after "
-                                    f"{elapsed:.1f}s, enabling image recognition."
-                                )
-                                image_fallback_active = True
-                                if hasattr(card_detector, "reset_session"):
-                                    card_detector.reset_session()
-                        else:
-                            visual_events = card_detector.detect(frame)
+                        if (
+                            accepted_event is None
+                            and speech_listen_started_at is not None
+                            and (
+                                time.monotonic() - speech_listen_started_at
+                                >= SPEECH_ONLY_TIMEOUT_SECONDS
+                            )
+                        ):
+                            print_separator()
+                            print(
+                                "[SPEECH] No valid speech request was recognized "
+                                f"within {SPEECH_ONLY_TIMEOUT_SECONDS:.1f} seconds."
+                            )
+                            print("[SPEECH] Speech recognition disabled.")
+                            print("[VISION] Object recognition fallback enabled.")
+                            print_separator()
 
-                    # ── 结果判定：语音优先 ──
-                    accepted_event = None
+                            speech_detector.disable()
+                            speech_detector.clear()
+                            request_input_mode = "vision"
+                            speech_listen_started_at = None
 
-                    if speech_event is not None:
-                        accepted_event = speech_event
-                    elif visual_events:
-                        accepted_event = dict(visual_events[0])
-                        accepted_event.setdefault("source", "vision")
+                            if hasattr(card_detector, "reset_session"):
+                                card_detector.reset_session()
+
+                    elif request_input_mode == "vision":
+                        visual_events = card_detector.detect(frame)
+
+                        if visual_events:
+                            accepted_event = dict(visual_events[0])
+                            accepted_event.setdefault("source", "vision")
 
                     if accepted_event is not None:
                         # Main-level lock: prevents visual and speech from
                         # creating two tasks in the same student interaction.
                         request_accepted = True
-
-                        # 停止录制并保存视频
-                        if recording_active and recording_writer is not None:
-                            recording_writer.release()
-                            recording_writer = None
-                            recording_active = False
-                            print(f"[RECORDING] 识别到结果，停止录制，视频已保存: {recording_filename}")
 
                         # Stop listening immediately after the first accepted
                         # request. The next student session will re-enable it.
@@ -880,7 +835,6 @@ def main(speech_detector=None):
                         axis_x = center[0] if center else None
                         axis_y = center[1] if center else None
                         source = accepted_event.get("source", "vision")
-                        confidence = accepted_event.get("confidence")
 
                         ui_manager.update_request(
                             request_type="语音" if source == "speech" else "物品",
@@ -891,7 +845,6 @@ def main(speech_detector=None):
                             ),
                             axis_x=axis_x,
                             axis_y=axis_y,
-                            confidence=confidence,
                         )
 
                 # draw() only displays the latest classifier result and must
@@ -1061,9 +1014,6 @@ def main(speech_detector=None):
 
         if camera is not None:
             camera.release()
-
-        if recording_writer is not None:
-            recording_writer.release()
 
         # 2. 等待接收线程退出后再关闭 socket
         time.sleep(0.8)

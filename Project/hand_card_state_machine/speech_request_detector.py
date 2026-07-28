@@ -315,45 +315,6 @@ class SpeechRequestDetector:
                 f"Request confirmed: {request}"
             )
 
-    def push_result(self, text: str) -> bool:
-        """Accept an externally transcribed text and queue it as a speech result.
-
-        This allows Whisper (or any other external recognizer) to feed results
-        into the same poll() queue used by the internal Google Speech worker.
-
-        Returns True if the result was accepted and queued, False otherwise.
-        """
-        if not self._enabled_event.is_set():
-            return False
-
-        with self._lock:
-            if self._latched:
-                return False
-            self._latched = True
-
-        request = self.parse_request(text)
-        if request is None:
-            with self._lock:
-                self._latched = False
-            return False
-
-        result = {
-            "id": REQUEST_IDS[request],
-            "source": "speech",
-            "request": request,
-            "text": text,
-            "confidence": 1.0,
-            "confirmed": True,
-            "center": None,
-        }
-
-        self._results.put(result)
-        print(
-            f"[SpeechRequestDetector] "
-            f"External result queued: {text!r} -> {request}"
-        )
-        return True
-
     def _recognize_waveform(self, waveform: np.ndarray) -> str:
         pcm16 = np.clip(waveform, -1.0, 1.0)
         pcm16 = (pcm16 * 32767.0).astype("<i2", copy=False)

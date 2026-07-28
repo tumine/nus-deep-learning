@@ -19,7 +19,6 @@ import json
 import mimetypes
 import os
 import socket
-import ssl
 import threading
 import time
 import uuid
@@ -95,32 +94,18 @@ class AudioDispatcher:
         request_path = parsed_url.path or "/"
         if parsed_url.query:
             request_path = f"{request_path}?{parsed_url.query}"
-        is_https = parsed_url.scheme == "https"
         connection_class = (
             http.client.HTTPSConnection
-            if is_https
+            if parsed_url.scheme == "https"
             else http.client.HTTPConnection
         )
 
         with self._lock:
-            if is_https:
-                # Accept self-signed certificates (used for localhost /
-                # LAN communication between the robot and the UI server).
-                ssl_context = ssl.create_default_context()
-                ssl_context.check_hostname = False
-                ssl_context.verify_mode = ssl.CERT_NONE
-                connection = connection_class(
-                    parsed_url.hostname,
-                    parsed_url.port,
-                    timeout=self.connect_timeout_seconds,
-                    context=ssl_context,
-                )
-            else:
-                connection = connection_class(
-                    parsed_url.hostname,
-                    parsed_url.port,
-                    timeout=self.connect_timeout_seconds,
-                )
+            connection = connection_class(
+                parsed_url.hostname,
+                parsed_url.port,
+                timeout=self.connect_timeout_seconds,
+            )
             try:
                 print(f"[AUDIO {trace_id}] POST {request_path} started.")
                 connection.connect()
