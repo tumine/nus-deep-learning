@@ -485,6 +485,12 @@ def main(speech_detector=None):
         recording_active = False
         recording_filename = None
 
+        # 自动重连相关变量
+        reconnect_in_progress = False
+        robot_connection_lost = False
+        reconnect_attempts = 0
+        last_reconnect_time = 0.0
+
         print("\n[MAIN] 状态触发控制说明:")
         print("  ▶ 正常情况：小车通过网络自动发送触发信号，自动跳转流程。")
         print("  ▶ 键盘测试：如果没连上小车，可使用以下按键手动模拟触发：")
@@ -818,11 +824,11 @@ def main(speech_detector=None):
                     speech_raw = speech_detector.poll()
                     speech_event = None
 
-                        if speech_raw is not None:
-                            accepted_event = normalize_speech_event(
-                                speech_raw,
-                                state_machine,
-                            )
+                    if speech_raw is not None:
+                        accepted_event = normalize_speech_event(
+                            speech_raw,
+                            state_machine,
+                        )
 
                     # ── 图像识别：仅在语音超时后启用 ──
                     visual_events = []
