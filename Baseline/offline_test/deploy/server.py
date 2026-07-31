@@ -18,7 +18,7 @@
     python -m deploy.server --model outputs/.../resnet50_cat.onnx --backend onnx
 
     # 指定端口和工作进程数
-    python -m deploy.server --model best_model.pth --port 8080 --workers 2
+    python -m deploy.server --model best_model.pth --port 8081 --workers 2
 
 生产环境启动（推荐使用 uvicorn 直接启动）：
 

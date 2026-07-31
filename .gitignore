@@ -88,4 +88,14 @@ Thumbs.db
 # --- CNN training outputs ---
 outputs
 
+# -- auxiliary images ---
+
 collected_images*
+
+calib_images
+
+request_dataset
+
+recordings
+
+audio

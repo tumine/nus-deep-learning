@@ -1,0 +1,7 @@
+# Classroom Assistant Robot
+# Required Python Packages
+
+opencv-contrib-python>=4.8.0
+numpy>=1.24
+fastapi>=0.110.0
+uvicorn>=0.27.0
